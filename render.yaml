@@ -1,6 +1,5 @@
 services:
   - type: web
-<<<<<<< HEAD
     name: videovault-api
     runtime: python
     buildCommand: pip install -r requirements.txt
@@ -9,15 +8,3 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-=======
-    name: videovault-server
-    runtime: python
-    buildCommand: |
-      pip install -r requirements.txt
-      apt-get install -y ffmpeg || true
-    startCommand: gunicorn app:app --workers 2 --timeout 300 --bind 0.0.0.0:$PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-    healthCheckPath: /health
->>>>>>> 0619f222e4c12ac25038a2697dc1f4cb4fc33226

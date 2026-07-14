@@ -1,13 +1,10 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
-import uuid
-import os
-import asyncio
 from typing import Optional
 
-app = FastAPI(title="VideoVault API")
+app = FastAPI(title="VideoVault API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,63 +40,92 @@ def detect_platform(url: str) -> str:
     return "other"
 
 def quality_to_format(quality: str) -> str:
-    formats = {
-        "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "1080":  "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-        "720":   "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-        "480":   "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
-        "360":   "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best",
+    """
+    Converts quality label to yt-dlp format string.
+    yt-dlp 2026.07.04 prefers mp4 progressive where possible,
+    falls back to bestvideo+bestaudio merge.
+    """
+    if quality == "best" or not quality.isdigit():
+        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+    h = quality
+    return (
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
+        f"/bestvideo[height<={h}]+bestaudio"
+        f"/best[height<={h}][ext=mp4]"
+        f"/best[height<={h}]"
+        f"/best"
+    )
+
+def base_ydl_opts() -> dict:
+    """
+    Common yt-dlp options tuned for 2026.07.04.
+    - player_client: ['ios', 'web'] gives best compatibility
+      iOS client bypasses many bot-detection issues on YouTube.
+    - No cookies needed for public videos.
+    """
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "nocheckcertificate": False,
+        "extractor_args": {
+            # Use iOS client first — most stable for public YouTube videos
+            # in the 2026.x era (avoids po_token requirement on server-side)
+            "youtube": {
+                "player_client": ["ios", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "com.google.ios.youtube/19.45.4 "
+                "(iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)"
+            ),
+        },
     }
-    return formats.get(quality, formats["best"])
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "VideoVault API"}
+    return {"status": "ok", "service": "VideoVault API", "yt_dlp": yt_dlp.version.__version__}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "yt_dlp_version": yt_dlp.version.__version__}
 
 
 @app.post("/info")
 def get_video_info(req: VideoInfoRequest):
     """
-    Возвращает информацию о видео:
-    - title, duration, thumbnail
-    - доступные качества
-    - платформа
+    Returns video metadata:
+    title, duration, thumbnail, platform, available qualities.
     """
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    opts = {
+        **base_ydl_opts(),
         "skip_download": True,
-        "socket_timeout": 30,
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
 
-            # Собираем доступные качества
-            qualities = set()
+            # Collect available MP4 qualities
+            qualities: set[int] = set()
             for f in info.get("formats", []):
                 h = f.get("height")
                 ext = f.get("ext", "")
-                if h and ext in ("mp4", "webm", "m4v"):
-                    if h >= 360:
-                        qualities.add(h)
+                vcodec = f.get("vcodec", "none")
+                # Only list formats that actually have video
+                if h and h >= 240 and vcodec != "none":
+                    qualities.add(h)
 
-            sorted_qualities = sorted(qualities, reverse=True)
-            quality_labels = [str(q) for q in sorted_qualities]
-            if not quality_labels:
-                quality_labels = ["best"]
+            sorted_q = sorted(qualities, reverse=True)
+            quality_labels = [str(q) for q in sorted_q] or ["best"]
 
             return {
                 "success": True,
                 "title": info.get("title", "Unknown"),
-                "duration": info.get("duration", 0),          # секунды
+                "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail"),
                 "platform": detect_platform(req.url),
                 "uploader": info.get("uploader", ""),
@@ -116,66 +142,81 @@ def get_video_info(req: VideoInfoRequest):
 @app.post("/download-url")
 def get_download_url(req: DownloadRequest):
     """
-    Возвращает прямую ссылку на скачивание видео.
-    Приложение скачивает видео напрямую по этой ссылке.
+    Returns a direct download URL for the video.
+    The mobile app downloads the file directly from this URL.
+
+    Strategy for yt-dlp 2026.07.04:
+    1. Try to find a single-file mp4 (video+audio, "progressive")
+    2. If not found, return the best video-only stream
+       (the app will need to handle audio separately — or we pick
+        the best combined format yt-dlp resolves)
     """
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+    opts = {
+        **base_ydl_opts(),
         "skip_download": True,
-        "format": quality_to_format(req.quality),
-        "socket_timeout": 30,
+        "format": quality_to_format(req.quality or "best"),
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
 
-            # Ищем лучший mp4 формат
             formats = info.get("formats", [])
-            best_url = None
+            target_height = int(req.quality) if (req.quality or "").isdigit() else 9999
+
+            # 1st pass: look for combined mp4 (vcodec + acodec, single file)
+            best: dict | None = None
             best_height = 0
-
-            target_height = int(req.quality) if req.quality.isdigit() else 9999
-
-            for f in reversed(formats):
+            for f in formats:
                 h = f.get("height") or 0
                 ext = f.get("ext", "")
-                url = f.get("url", "")
                 vcodec = f.get("vcodec", "none")
                 acodec = f.get("acodec", "none")
-
-                # Ищем формат с видео и аудио вместе (progressive)
+                url = f.get("url", "")
                 if (ext == "mp4" and vcodec != "none" and acodec != "none"
                         and h <= target_height and h > best_height and url):
-                    best_url = url
+                    best = f
                     best_height = h
 
-            # Если нет progressive, берём любой подходящий
-            if not best_url:
+            # 2nd pass: any format with video
+            if not best:
                 for f in reversed(formats):
-                    url = f.get("url", "")
                     h = f.get("height") or 0
-                    if url and h <= target_height:
-                        best_url = url
+                    url = f.get("url", "")
+                    vcodec = f.get("vcodec", "none")
+                    if url and vcodec != "none" and h <= target_height:
+                        best = f
                         best_height = h
                         break
 
-            if not best_url:
-                # Последний вариант — url самого info
-                best_url = info.get("url")
-
-            if not best_url:
-                raise HTTPException(status_code=404, detail="No downloadable format found")
+            # Last resort: top-level url
+            if not best:
+                direct = info.get("url")
+                if not direct:
+                    raise HTTPException(status_code=404, detail="No downloadable format found")
+                return {
+                    "success": True,
+                    "download_url": direct,
+                    "title": info.get("title", "video"),
+                    "ext": info.get("ext", "mp4"),
+                    "filesize": info.get("filesize") or info.get("filesize_approx") or 0,
+                    "height": 0,
+                    "platform": detect_platform(req.url),
+                    # Pass headers so the app can authenticate the download request
+                    "headers": dict(info.get("http_headers", {})),
+                }
 
             return {
                 "success": True,
-                "download_url": best_url,
+                "download_url": best["url"],
                 "title": info.get("title", "video"),
-                "ext": "mp4",
-                "filesize": info.get("filesize") or info.get("filesize_approx", 0),
+                "ext": best.get("ext", "mp4"),
+                "filesize": best.get("filesize") or best.get("filesize_approx") or 0,
                 "height": best_height,
                 "platform": detect_platform(req.url),
+                # Important: some platforms (YouTube iOS) require
+                # the original request headers to download the file
+                "headers": dict(best.get("http_headers", info.get("http_headers", {}))),
             }
 
     except HTTPException:
