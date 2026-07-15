@@ -1,5 +1,5 @@
 services:
   - type: web
-    name: videovault-api
+    name: videovault-server
     runtime: docker
     plan: free

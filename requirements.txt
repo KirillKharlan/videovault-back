@@ -1,8 +1,6 @@
-fastapi==0.115.6
-uvicorn==0.34.0
-pydantic==2.10.4
-
-# yt-dlp 2026.07.04 + все зависимости из pyproject.toml [default]
+flask==3.1.0
+flask-cors==5.0.0
+gunicorn==23.0.0
 yt-dlp==2026.7.4
 brotli; implementation_name == 'cpython'
 brotlicffi; implementation_name != 'cpython'
@@ -13,4 +11,3 @@ requests>=2.32.2,<3
 urllib3>=2.0.2,<3
 websockets>=13.0
 yt-dlp-ejs==0.8.0
-gunicorn==23.0.0
