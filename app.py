@@ -11,6 +11,10 @@ from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
 
 app = Flask(__name__)
+@app.before_request
+def log_request_info():
+    print(f"[REQUEST] {request.method} {request.url}")
+    print(f"[REQUEST BODY] {request.get_data()}")
 CORS(app, origins="*")
 
 
