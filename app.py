@@ -13,12 +13,14 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app, origins="*")
 
+
+BASE_DIR = Path(__file__).resolve().parent
 TMP_DIR = Path(tempfile.gettempdir()) / "videovault"
 TMP_DIR.mkdir(exist_ok=True)
 
 # Файл для хранения задач — переживает sleep сервера
-TASKS_FILE = TMP_DIR / "tasks.json"
-COOKIES_FILE = TMP_DIR / "cookies.txt"
+TASKS_FILE = BASE_DIR / "tasks.json"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
 _tasks_lock = threading.Lock()
 
 
@@ -76,7 +78,7 @@ def setup_cookies() -> str | None:
         print(f"[cookies] Failed to decode: {e}")
         return None
 
-
+setup_cookies()  # Записываем cookies при старте
 # ── Очистка старых файлов ─────────────────────────────────────────────────────
 
 def cleanup_loop():
