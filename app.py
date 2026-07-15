@@ -30,19 +30,26 @@ _tasks_lock = threading.Lock()
 
 # ── Хранение задач на диске ───────────────────────────────────────────────────
 
+_tasks_cache = {}
+
 def load_tasks() -> dict:
+    global _tasks_cache
+    if _tasks_cache:
+        return _tasks_cache
     try:
         if TASKS_FILE.exists():
-            return json.loads(TASKS_FILE.read_text())
+            _tasks_cache = json.loads(TASKS_FILE.read_text())
+            return _tasks_cache
     except Exception:
         pass
-    return {}
+    _tasks_cache = {}
+    return _tasks_cache
 
 def save_tasks(tasks: dict):
     try:
         TASKS_FILE.write_text(json.dumps(tasks))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERROR] Save tasks failed: {e}")
 
 def get_task(task_id: str) -> dict | None:
     with _tasks_lock:
@@ -52,6 +59,7 @@ def set_task(task_id: str, data: dict):
     with _tasks_lock:
         tasks = load_tasks()
         tasks[task_id] = data
+        _tasks_cache = tasks
         save_tasks(tasks)
 
 def update_task(task_id: str, **kw):
@@ -59,7 +67,9 @@ def update_task(task_id: str, **kw):
         tasks = load_tasks()
         if task_id in tasks:
             tasks[task_id].update(kw)
-            save_tasks(tasks)
+            _tasks_cache = tasks
+            if kw.get("status") in ["done", "error", "queued"]:
+                save_tasks(tasks)
 
 
 # ── Cookies из env переменной ─────────────────────────────────────────────────
