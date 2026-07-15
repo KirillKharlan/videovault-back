@@ -151,7 +151,12 @@ def ytdlp_base_args() -> list[str]:
 
 def get_video_info(url: str) -> dict:
     try:
-        cmd = ytdlp_base_args() + ["--dump-json", url]
+        cmd = ytdlp_base_args() + [
+            "--dump-json", 
+            "--ignore-no-formats-error", 
+            "--format", "best/bestvideo+bestaudio",
+            url
+        ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
 
         if r.returncode == 0 and r.stdout.strip():
@@ -201,7 +206,7 @@ def download_task(task_id: str, url: str, quality: str):
                f"/best[height<={quality}][ext=mp4]/best[height<={quality}]/best")
     else:
         fmt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best"
-
+    
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
