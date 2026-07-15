@@ -59,8 +59,6 @@ def update_task(task_id: str, **kw):
 
 
 # ── Cookies из env переменной ─────────────────────────────────────────────────
-# На Render задаём переменную окружения YT_COOKIES_B64
-# (содержимое Netscape cookies.txt закодированное в base64)
 
 def setup_cookies() -> str | None:
     """
@@ -79,6 +77,8 @@ def setup_cookies() -> str | None:
         return None
 
 setup_cookies()  # Записываем cookies при старте
+
+
 # ── Очистка старых файлов ─────────────────────────────────────────────────────
 
 def cleanup_loop():
@@ -95,7 +95,8 @@ def cleanup_loop():
                         Path(fp).unlink(missing_ok=True)
                     to_del.append(tid)
             for tid in to_del:
-                del tasks[tid]
+                if tid in tasks:
+                    del tasks[tid]
             save_tasks(tasks)
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
@@ -137,10 +138,9 @@ def ytdlp_base_args() -> list[str]:
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
-        # Пробуем разные клиенты по очереди
-        "--extractor-args", "youtube:player_client=ios,tv_embedded,web",
+        # Оптимальний набір клієнтів для стабільної роботи з проксі/кукі
+        "--extractor-args", "youtube:player_client=android,web",
     ]
-    # Добавляем cookies если есть
     cookies_path = setup_cookies()
     if cookies_path:
         args += ["--cookies", cookies_path]
@@ -151,10 +151,10 @@ def ytdlp_base_args() -> list[str]:
 
 def get_video_info(url: str) -> dict:
     try:
+        # Для отримання інфо НЕ обмежуємо формати, даємо yt-dlp прочитати все доступне
         cmd = ytdlp_base_args() + [
             "--dump-json", 
             "--ignore-no-formats-error", 
-            "--format", "best/bestvideo+bestaudio",
             url
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -201,20 +201,15 @@ def download_task(task_id: str, url: str, quality: str):
     title = info["title"]
     update_task(task_id, title=title, step="Подготовка к загрузке…")
     
-    # Очищуємо значення якості, якщо фронтенд прислав щось на кшталт "1080p" або "bestp"
-    clean_q = re.sub(r"\D", "", quality)  # залишить тільки цифри (наприклад, "1080" або "" для "bestp")
+    # Очищуємо якість від літер (наприклад, "bestp" -> "", "720p" -> "720")
+    clean_q = re.sub(r"\D", "", quality)
 
     if clean_q and clean_q.isdigit():
-        # Шукаємо відео не вище вказаної якості + найкращий звук у БУДЬ-ЯКОМУ форматі,
-        # а якщо не виходить — беремо просто найкращий доступний варіант до цієї висоти
-        fmt = (f"bestvideo[height<={clean_q}][ext=mp4]+bestaudio[ext=m4a]/"
-               f"bestvideo[height<={clean_q}]+bestaudio/"
-               f"best[height<={clean_q}]/best")
+        # Максимально всеїдний вибір форматів без прив'язки до розширень. FFmpeg все склеїть самостійно!
+        fmt = f"bestvideo[height<={clean_q}]+bestaudio/best[height<={clean_q}]/best"
     else:
-        # Стандартний режим (якщо прийшло "bestp", "best" або порожнє значення) — максимум 720p для економії трафіку сервера
-        fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-               "bestvideo[height<=720]+bestaudio/"
-               "best[height<=720]/best")
+        # Режим за замовчуванням (до 720р)
+        fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
     
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
