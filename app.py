@@ -210,6 +210,10 @@ def download_task(task_id: str, url: str, quality: str):
     else:
         # Режим за замовчуванням (до 720р)
         fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        
+    print(f"[DEBUG] Raw quality from app: '{quality}'")
+    print(f"[DEBUG] Cleaned quality: '{clean_q}'")
+    print(f"[DEBUG] Selected format string (fmt): '{fmt}'")
     
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
