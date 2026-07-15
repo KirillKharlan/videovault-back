@@ -200,12 +200,21 @@ def download_task(task_id: str, url: str, quality: str):
 
     title = info["title"]
     update_task(task_id, title=title, step="Подготовка к загрузке…")
+    
+    # Очищуємо значення якості, якщо фронтенд прислав щось на кшталт "1080p" або "bestp"
+    clean_q = re.sub(r"\D", "", quality)  # залишить тільки цифри (наприклад, "1080" або "" для "bestp")
 
-    if quality.isdigit():
-        fmt = (f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]"
-               f"/best[height<={quality}][ext=mp4]/best[height<={quality}]/best")
+    if clean_q and clean_q.isdigit():
+        # Шукаємо відео не вище вказаної якості + найкращий звук у БУДЬ-ЯКОМУ форматі,
+        # а якщо не виходить — беремо просто найкращий доступний варіант до цієї висоти
+        fmt = (f"bestvideo[height<={clean_q}][ext=mp4]+bestaudio[ext=m4a]/"
+               f"bestvideo[height<={clean_q}]+bestaudio/"
+               f"best[height<={clean_q}]/best")
     else:
-        fmt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best"
+        # Стандартний режим (якщо прийшло "bestp", "best" або порожнє значення) — максимум 720p для економії трафіку сервера
+        fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+               "bestvideo[height<=720]+bestaudio/"
+               "best[height<=720]/best")
     
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
