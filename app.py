@@ -79,6 +79,9 @@ def setup_cookies() -> str | None:
     Записывает cookies.txt из env и возвращает путь к нему.
     Если env не задан — возвращает None.
     """
+    
+    print(f"[DEBUG] Cookies file exists: {COOKIES_FILE.exists()}, size: {COOKIES_FILE.stat().st_size if COOKIES_FILE.exists() else 0} bytes")
+    
     b64 = os.environ.get("YT_COOKIES_B64", "").strip()
     if not b64:
         return None
@@ -153,7 +156,7 @@ def ytdlp_base_args() -> list[str]:
         "--no-playlist",
         "--no-warnings",
         # Оптимальний набір клієнтів для стабільної роботи з проксі/кукі
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=android,ios",
     ]
     cookies_path = setup_cookies()
     if cookies_path:
