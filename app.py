@@ -123,7 +123,11 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 
 ERROR_PATTERNS = [
     (["sign in to confirm", "confirm you're not a bot", "bot detection"],
-     "bot", "🤖 YouTube требует авторизацию — нужно настроить cookies (см. README)"),
+     "bot", "🤖 YouTube требует авторизацию — нужно настроить cookies"),
+    (["failed to extract any player response", "player response"],
+     "player", "⚠️ YouTube изменил защиту. Сервер обновляет yt-dlp, попробуйте через 1 минуту."),
+    (["requested format is not available"],
+     "format", "⚠️ Формат недоступен — попробуйте другое качество или нажмите Скачать ещё раз"),
     (["private video", "video is private"],
      "private", "🔒 Видео приватное"),
     (["age-restricted", "sign in to confirm your age"],
@@ -156,7 +160,9 @@ def ytdlp_base_args() -> list[str]:
         "--no-playlist",
         "--no-warnings",
         # Оптимальний набір клієнтів для стабільної роботи з проксі/кукі
-        "--extractor-args", "youtube:player_client=android,ios",
+        # tv_embedded + web_creator — наиболее стабильные клиенты в 2026
+        # не требуют po_token и работают с cookies
+        "--extractor-args", "youtube:player_client=tv_embedded,web_creator,ios",
     ]
     cookies_path = setup_cookies()
     if cookies_path:

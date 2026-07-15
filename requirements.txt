@@ -1,13 +1,5 @@
 flask==3.1.0
 flask-cors==5.0.0
 gunicorn==23.0.0
-yt-dlp==2026.7.4
-brotli; implementation_name == 'cpython'
-brotlicffi; implementation_name != 'cpython'
-certifi>=2026.6.17
-mutagen
-pycryptodomex
-requests>=2.32.2,<3
-urllib3>=2.0.2,<3
-websockets>=13.0
-yt-dlp-ejs==0.8.0
+# yt-dlp устанавливается через start.sh при каждом запуске (всегда последняя версия)
+# НЕ фиксируем версию здесь намеренно
