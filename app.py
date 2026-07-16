@@ -29,21 +29,16 @@ _tasks_lock = threading.Lock()
 
 
 # ── Хранение задач на диске ───────────────────────────────────────────────────
-
-_tasks_cache = {}
+# Кеш в памяти намеренно убран — при перезапуске сервера (обновление yt-dlp)
+# задачи должны читаться с диска, а не теряться из памяти.
 
 def load_tasks() -> dict:
-    global _tasks_cache
-    if _tasks_cache:
-        return _tasks_cache
     try:
         if TASKS_FILE.exists():
-            _tasks_cache = json.loads(TASKS_FILE.read_text())
-            return _tasks_cache
+            return json.loads(TASKS_FILE.read_text())
     except Exception:
         pass
-    _tasks_cache = {}
-    return _tasks_cache
+    return {}
 
 def save_tasks(tasks: dict):
     try:
@@ -59,7 +54,6 @@ def set_task(task_id: str, data: dict):
     with _tasks_lock:
         tasks = load_tasks()
         tasks[task_id] = data
-        _tasks_cache = tasks
         save_tasks(tasks)
 
 def update_task(task_id: str, **kw):
@@ -67,9 +61,8 @@ def update_task(task_id: str, **kw):
         tasks = load_tasks()
         if task_id in tasks:
             tasks[task_id].update(kw)
-            _tasks_cache = tasks
-            if kw.get("status") in ["done", "error", "queued"]:
-                save_tasks(tasks)
+            # Всегда сохраняем на диск — это медленнее но надёжнее
+            save_tasks(tasks)
 
 
 # ── Cookies из env переменной ─────────────────────────────────────────────────

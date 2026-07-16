@@ -2,19 +2,18 @@
 set -e
 
 echo "=== VideoVault Backend Starting ==="
+echo "[startup] yt-dlp version at start: $(yt-dlp --version 2>/dev/null || echo 'not installed')"
+echo "[startup] ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
 
-# Устанавливаем/обновляем yt-dlp до последней версии при каждом запуске
-# Это важно — YouTube меняет защиту каждые 1-2 недели
-echo "[startup] Installing latest yt-dlp..."
+# Обновляем yt-dlp ДО старта gunicorn — один раз при деплое
+# После этого gunicorn запускается и больше не перезапускается
+echo "[startup] Updating yt-dlp to latest..."
 pip install --quiet --upgrade yt-dlp yt-dlp-ejs
+echo "[startup] yt-dlp updated to: $(yt-dlp --version)"
 
-echo "[startup] yt-dlp version: $(yt-dlp --version)"
-echo "[startup] ffmpeg version: $(ffmpeg -version 2>&1 | head -1)"
-
-# Запускаем gunicorn
 echo "[startup] Starting gunicorn..."
 exec gunicorn app:app \
-  --workers 2 \
+  --workers 1 \
   --timeout 300 \
   --bind "0.0.0.0:${PORT:-8000}" \
   --log-level info \
