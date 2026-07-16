@@ -216,20 +216,24 @@ def download_task(task_id: str, url: str, quality: str):
 
     title = info["title"]
     update_task(task_id, title=title, step="Подготовка к загрузке…")
-    
-    # Очищуємо якість від літер (наприклад, "bestp" -> "", "720p" -> "720")
+
+    # Убираем всё нечисловое из quality ("720p" → "720", "best" → "")
     clean_q = re.sub(r"\D", "", quality)
 
     if clean_q and clean_q.isdigit():
-        # Максимально всеїдний вибір форматів без прив'язки до розширень. FFmpeg все склеїть самостійно!
-        fmt = f"bestvideo[height<={clean_q}]+bestaudio/best[height<={clean_q}]/best"
+        # Конкретное качество — ищем с запасными вариантами
+        fmt = (
+            f"bestvideo[height<={clean_q}]+bestaudio"
+            f"/bestvideo[height<={clean_q}]+bestaudio[ext=m4a]"
+            f"/best[height<={clean_q}]"
+            f"/best"
+        )
     else:
-        # Режим за замовчуванням (до 720р)
-        fmt = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
-        
-    print(f"[DEBUG] Raw quality from app: '{quality}'")
-    print(f"[DEBUG] Cleaned quality: '{clean_q}'")
-    print(f"[DEBUG] Selected format string (fmt): '{fmt}'")
+        # "best" или что угодно другое — просто берём лучшее доступное
+        # Без ограничений по высоте и кодекам — работает с любым клиентом
+        fmt = "bestvideo+bestaudio/best"
+
+    print(f"[DEBUG] quality='{quality}' clean_q='{clean_q}' fmt='{fmt}'")
     
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
