@@ -27,6 +27,13 @@ TASKS_FILE = BASE_DIR / "tasks.json"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 _tasks_lock = threading.Lock()
 
+# Кеш результатов /api/info — чтобы /api/download не делал повторный
+# запрос к YouTube для того же URL (это удваивало риск сбоя и выглядело
+# для YouTube как подозрительная повторная активность).
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_cache_lock = threading.Lock()
+INFO_CACHE_TTL = 600  # 10 минут
+
 
 # ── Хранение задач на диске ───────────────────────────────────────────────────
 # Кеш в памяти намеренно убран — при перезапуске сервера (обновление yt-dlp)
@@ -165,12 +172,30 @@ def ytdlp_base_args() -> list[str]:
 
 # ── Получение информации о видео ──────────────────────────────────────────────
 
-def get_video_info(url: str) -> dict:
+def get_video_info(url: str, use_cache: bool = True) -> dict:
+    # ── Проверяем кеш ────────────────────────────────────────────────────
+    if use_cache:
+        with _info_cache_lock:
+            cached = _info_cache.get(url)
+            if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
+                print(f"[DEBUG] Info cache HIT for {url[:50]}")
+                return cached[1]
+
+    result = _fetch_video_info_uncached(url)
+
+    # Сохраняем в кеш только успешные результаты
+    if "error" not in result:
+        with _info_cache_lock:
+            _info_cache[url] = (time.time(), result)
+
+    return result
+
+
+def _fetch_video_info_uncached(url: str, retry: bool = True) -> dict:
     try:
-        # Для отримання інфо НЕ обмежуємо формати, даємо yt-dlp прочитати все доступне
         cmd = ytdlp_base_args() + [
-            "--dump-json", 
-            "--ignore-no-formats-error", 
+            "--dump-json",
+            "--ignore-no-formats-error",
             url
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -194,9 +219,20 @@ def get_video_info(url: str) -> dict:
             }
 
         err_type, message = classify_error(r.stderr + r.stdout)
+
+        # Одна повторная попытка при транзиентных ошибках
+        # (сервер только проснулся, cookies не успели прогрузиться и т.п.)
+        if retry and err_type in ("unsupported", "unknown", "network"):
+            print(f"[DEBUG] Info fetch failed ({err_type}), retrying once in 2s...")
+            time.sleep(2)
+            return _fetch_video_info_uncached(url, retry=False)
+
         return {"error": message, "error_type": err_type}
 
     except subprocess.TimeoutExpired:
+        if retry:
+            time.sleep(2)
+            return _fetch_video_info_uncached(url, retry=False)
         return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}
     except Exception as e:
         return {"error": str(e), "error_type": "unknown"}
