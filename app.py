@@ -155,7 +155,7 @@ def ytdlp_base_args() -> list[str]:
         # Оптимальний набір клієнтів для стабільної роботи з проксі/кукі
         # tv_embedded + web_creator — наиболее стабильные клиенты в 2026
         # не требуют po_token и работают с cookies
-        "--extractor-args", "youtube:player_client=web,tv_embedded,ios",
+        "--extractor-args", "youtube:player_client=tv_embedded,web_creator,ios",
     ]
     cookies_path = setup_cookies()
     if cookies_path:
@@ -217,73 +217,40 @@ def download_task(task_id: str, url: str, quality: str):
     title = info["title"]
     update_task(task_id, title=title, step="Подготовка к загрузке…")
 
-    # Убираем всё нечисловое из quality ("720p" → "720", "best" → "")
     clean_q = re.sub(r"\D", "", quality)
 
-    # ── Шаг 1: узнаём реальные форматы которые YouTube отдаёт ──────────────
-    # Это нужно чтобы не гадать — просто смотрим что есть и выбираем лучшее
-    list_cmd = ytdlp_base_args() + ["--dump-json", url]
-    list_r = subprocess.run(list_cmd, capture_output=True, text=True, timeout=45)
+    # ── Строим аргументы для yt-dlp ──────────────────────────────────────
+    # Используем --format-sort вместо -f с жёсткими фильтрами.
+    # format-sort работает с ЛЮБЫМ типом форматов (muxed или DASH)
+    # и сам выбирает лучшее доступное — не падает с "format not available".
+    base = ytdlp_base_args()
 
-    available_formats = []
-    has_separate_streams = False  # есть ли отдельные видео/аудио потоки (DASH)
-
-    if list_r.returncode == 0 and list_r.stdout.strip():
-        try:
-            info_json = json.loads(list_r.stdout.strip().split("\n")[0])
-            for f in info_json.get("formats", []):
-                vcodec = f.get("vcodec", "none")
-                acodec = f.get("acodec", "none")
-                fmt_id = f.get("format_id", "")
-                height = f.get("height", 0) or 0
-                ext    = f.get("ext", "")
-                available_formats.append(
-                    f"  id={fmt_id} h={height} ext={ext} v={vcodec[:8]} a={acodec[:8]}"
-                )
-                # DASH формат = только видео БЕЗ аудио (или только аудио)
-                if vcodec != "none" and acodec == "none":
-                    has_separate_streams = True
-        except Exception as e:
-            print(f"[DEBUG] Format parse error: {e}")
-
-    print(f"[DEBUG] has_separate_streams={has_separate_streams}")
-    print(f"[DEBUG] Available formats:\n" + "\n".join(available_formats[:20]))
-
-    # ── Шаг 2: выбираем формат в зависимости от того что доступно ──────────
-    if has_separate_streams:
-        # DASH доступен — можем выбрать качество и склеить через ffmpeg
-        if clean_q and clean_q.isdigit():
-            h = clean_q
-            fmt = (
-                f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-                f"/bestvideo[height<={h}]+bestaudio"
-                f"/best[height<={h}]"
-                f"/best"
-            )
-        else:
-            fmt = (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo+bestaudio"
-                "/best[ext=mp4]"
-                "/best"
-            )
+    if clean_q and clean_q.isdigit():
+        h = int(clean_q)
+        # Выбираем лучшее видео до нужной высоты
+        # -S сортирует форматы: сначала по высоте, потом по расширению, потом кодек
+        extra_args = [
+            "--format-sort", f"res:{h},ext:mp4:m4a,+codec:avc:m4a",
+            # Ограничиваем высоту через height filter как запасной
+            "-f", f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
+        ]
     else:
-        # Только muxed форматы (iOS/tv клиент) — берём лучший готовый файл
-        # НЕ используем + (требует два потока)
-        if clean_q and clean_q.isdigit():
-            fmt = f"best[height<={clean_q}][ext=mp4]/best[height<={clean_q}]/best[ext=mp4]/best"
-        else:
-            fmt = "best[ext=mp4]/best"
+        # best — просто сортируем по качеству
+        extra_args = [
+            "--format-sort", "res,ext:mp4:m4a,+codec:avc:m4a",
+            "-f", "bestvideo+bestaudio/best",
+        ]
 
-    print(f"[DEBUG] quality='{quality}' clean_q='{clean_q}' has_dash={has_separate_streams} fmt='{fmt}'")
-    
+    print(f"[DEBUG] quality='{quality}' clean_q='{clean_q}' extra_args={extra_args}")
+
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
-    cmd = ytdlp_base_args() + [
+    cmd = base + extra_args + [
         "--newline",
-        "-f", fmt,
         "--merge-output-format", "mp4",
+        # Если формат недоступен — не падать, взять что есть
+        "--ignore-no-formats-error",
         "-o", out,
         url,
     ]

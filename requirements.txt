@@ -1,5 +1,5 @@
-flask==3.1.0
-flask-cors==5.0.0
-gunicorn==23.0.0
-# yt-dlp устанавливается через start.sh при каждом запуске (всегда последняя версия)
-# НЕ фиксируем версию здесь намеренно
+# Устанавливаем из исходников с GitHub (последние версии из загруженных zip)
+flask @ https://github.com/pallets/flask/archive/refs/heads/main.zip
+flask-cors @ https://github.com/corydolphin/flask-cors/archive/refs/heads/main.zip
+gunicorn @ https://github.com/benoitc/gunicorn/archive/refs/heads/master.zip
+# yt-dlp устанавливается через start.sh при каждом запуске
