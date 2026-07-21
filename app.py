@@ -165,10 +165,10 @@ def classify_error(text: str) -> tuple[str, str]:
 # Разные наборы клиентов — YouTube блокирует их избирательно в зависимости
 # от видео/региона/аккаунта. Если один набор не сработал — пробуем другой.
 CLIENT_SETS = [
-    "tv_embedded,web_creator,ios",
-    "web,mweb",
-    "android,ios",
-    "tv_embedded",
+    "ios",              # Мобильный клиент — лучше всего работает с Shorts
+    "android",          # Второй мобильный вариант
+    "web,mweb",         # Веб-клиенты — хорошо для обычных длинных видео
+    "tv_embedded",       # Последний резерв
 ]
 
 def ytdlp_base_args(client_set_index: int = 0) -> list[str]:
@@ -216,7 +216,7 @@ def get_cached_client_index(url: str) -> int:
         return cached[2] if cached else 0
 
 
-def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 3) -> tuple[dict, int]:
+def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 4) -> tuple[dict, int]:
     try:
         cmd = ytdlp_base_args(client_index) + [
             "--dump-json",
@@ -234,11 +234,25 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
                 if h and h >= 240 and vcodec != "none":
                     qualities.add(h)
             sorted_q = sorted(qualities, reverse=True)
-            print(f"[DEBUG] Info OK with client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}'")
+            duration = int(info.get("duration") or 0)
+
+            # Клиент ответил, но реальных данных почти нет (0 форматов, 0 длительность).
+            # Часто бывает с tv_embedded/web_creator на YouTube Shorts — они отдают
+            # обрезанные метаданные. Считаем это неудачей и пробуем другого клиента,
+            # если попытки ещё остались.
+            is_poor_data = not sorted_q and duration == 0
+            if is_poor_data and attempts_left > 1:
+                print(f"[DEBUG] client_set[{client_index}] gave poor data "
+                      f"(no formats, duration=0) — trying next client")
+                time.sleep(1.0)
+                return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
+
+            print(f"[DEBUG] Info OK with client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}' "
+                  f"qualities={sorted_q} duration={duration}")
             return {
                 "title":     info.get("title", "Видео"),
                 "thumbnail": info.get("thumbnail", ""),
-                "duration":  int(info.get("duration") or 0),
+                "duration":  duration,
                 "uploader":  info.get("uploader", ""),
                 "platform":  info.get("extractor_key", "").lower(),
                 "qualities": [str(q) for q in sorted_q] or ["best"],
