@@ -162,26 +162,30 @@ def classify_error(text: str) -> tuple[str, str]:
 
 # ── yt-dlp аргументы ──────────────────────────────────────────────────────────
 
-# Разные наборы клиентов — YouTube блокирует их избирательно в зависимости
-# от видео/региона/аккаунта. Если один набор не сработал — пробуем другой.
-CLIENT_SETS = [
-    "ios",              # Мобильный клиент — лучше всего работает с Shorts
-    "android",          # Второй мобильный вариант
-    "web,mweb",         # Веб-клиенты — хорошо для обычных длинных видео
-    "tv_embedded",       # Последний резерв
+# Каждая попытка — (клиент(ы), использовать_cookies).
+# Если cookies просрочены/повреждены, YouTube может отдавать урезанные
+# данные ДАЖЕ ПРИ returncode==0 (без явной ошибки) — поэтому у нас есть
+# варианты без cookies как fallback, а не только разные клиенты.
+CLIENT_ATTEMPTS: list[tuple[str, bool]] = [
+    ("ios", True),
+    ("android", True),
+    ("ios", False),          # без cookies — на случай если они "портят" ответ
+    ("web,mweb", False),
+    ("tv_embedded", False),
 ]
 
-def ytdlp_base_args(client_set_index: int = 0) -> list[str]:
-    clients = CLIENT_SETS[client_set_index % len(CLIENT_SETS)]
+def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
+    clients, use_cookies = CLIENT_ATTEMPTS[attempt_index % len(CLIENT_ATTEMPTS)]
     args = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
         "--extractor-args", f"youtube:player_client={clients}",
     ]
-    cookies_path = setup_cookies()
-    if cookies_path:
-        args += ["--cookies", cookies_path]
+    if use_cookies:
+        cookies_path = setup_cookies()
+        if cookies_path:
+            args += ["--cookies", cookies_path]
     return args
 
 
@@ -216,7 +220,7 @@ def get_cached_client_index(url: str) -> int:
         return cached[2] if cached else 0
 
 
-def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 4) -> tuple[dict, int]:
+def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 5) -> tuple[dict, int]:
     try:
         cmd = ytdlp_base_args(client_index) + [
             "--dump-json",
@@ -227,8 +231,9 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
 
         if r.returncode == 0 and r.stdout.strip():
             info = json.loads(r.stdout.strip().split("\n")[0])
+            raw_formats = info.get("formats", [])
             qualities = set()
-            for f in info.get("formats", []):
+            for f in raw_formats:
                 h = f.get("height")
                 vcodec = f.get("vcodec", "none")
                 if h and h >= 240 and vcodec != "none":
@@ -236,18 +241,22 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             sorted_q = sorted(qualities, reverse=True)
             duration = int(info.get("duration") or 0)
 
+            # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
+            print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
+                  f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
+
             # Клиент ответил, но реальных данных почти нет (0 форматов, 0 длительность).
-            # Часто бывает с tv_embedded/web_creator на YouTube Shorts — они отдают
-            # обрезанные метаданные. Считаем это неудачей и пробуем другого клиента,
-            # если попытки ещё остались.
+            # Может быть из-за YouTube Shorts С определёнными клиентами, ИЛИ из-за
+            # просроченных/повреждённых cookies (см. CLIENT_ATTEMPTS — там есть
+            # варианты и с cookies, и без). Считаем неудачей и пробуем следующую
+            # комбинацию если попытки ещё остались.
             is_poor_data = not sorted_q and duration == 0
             if is_poor_data and attempts_left > 1:
-                print(f"[DEBUG] client_set[{client_index}] gave poor data "
-                      f"(no formats, duration=0) — trying next client")
+                print(f"[DEBUG] Poor data (no formats, duration=0) — trying next attempt")
                 time.sleep(1.0)
                 return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
 
-            print(f"[DEBUG] Info OK with client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}' "
+            print(f"[DEBUG] Info OK with attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
                   f"qualities={sorted_q} duration={duration}")
             return {
                 "title":     info.get("title", "Видео"),
@@ -258,7 +267,7 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
                 "qualities": [str(q) for q in sorted_q] or ["best"],
             }, client_index
 
-        print(f"[DEBUG] yt-dlp FAILED client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}'")
+        print(f"[DEBUG] yt-dlp FAILED attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}")
         print(f"[DEBUG] stderr: {r.stderr[-800:]}")
         print(f"[DEBUG] stdout: {r.stdout[-300:]}")
 
@@ -319,16 +328,16 @@ def download_task(task_id: str, url: str, quality: str):
 
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
-    max_attempts = len(CLIENT_SETS)
+    max_attempts = len(CLIENT_ATTEMPTS)
     last_stderr = ""
     last_stdout_lines: list[str] = []
 
     for attempt in range(max_attempts):
-        client_index = (working_client_index + attempt) % len(CLIENT_SETS)
+        client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
         extra_args = build_format_args(height)
 
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
-              f"client_set[{client_index}]='{CLIENT_SETS[client_index]}' extra_args={extra_args}")
+              f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} extra_args={extra_args}")
 
         cmd = ytdlp_base_args(client_index) + extra_args + [
             "--newline",
