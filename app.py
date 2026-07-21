@@ -30,7 +30,7 @@ _tasks_lock = threading.Lock()
 # Кеш результатов /api/info — чтобы /api/download не делал повторный
 # запрос к YouTube для того же URL (это удваивало риск сбоя и выглядело
 # для YouTube как подозрительная повторная активность).
-_info_cache: dict[str, tuple[float, dict]] = {}
+_info_cache: dict[str, tuple[float, dict, int]] = {}  # url -> (ts, info, working_client_index)
 _info_cache_lock = threading.Lock()
 INFO_CACHE_TTL = 600  # 10 минут
 
@@ -77,17 +77,25 @@ def update_task(task_id: str, **kw):
 def setup_cookies() -> str | None:
     """
     Записывает cookies.txt из env и возвращает путь к нему.
-    Если env не задан — возвращает None.
+    Запись атомарная (через временный файл + rename) — чтобы параллельный
+    запрос не прочитал файл в момент его перезаписи (могло давать
+    'Unsupported URL' из-за повреждённого cookies.txt).
     """
-    
-    print(f"[DEBUG] Cookies file exists: {COOKIES_FILE.exists()}, size: {COOKIES_FILE.stat().st_size if COOKIES_FILE.exists() else 0} bytes")
-    
     b64 = os.environ.get("YT_COOKIES_B64", "").strip()
     if not b64:
         return None
+
+    # Если файл уже записан и не пустой — не перезаписываем его каждый раз,
+    # это устраняет гонку между параллельными запросами.
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 100:
+        return str(COOKIES_FILE)
+
     try:
         decoded = base64.b64decode(b64).decode("utf-8")
-        COOKIES_FILE.write_text(decoded)
+        tmp_path = COOKIES_FILE.with_suffix(".tmp")
+        tmp_path.write_text(decoded)
+        tmp_path.replace(COOKIES_FILE)  # атомарная операция на уровне ОС
+        print(f"[cookies] Written, size={COOKIES_FILE.stat().st_size} bytes")
         return str(COOKIES_FILE)
     except Exception as e:
         print(f"[cookies] Failed to decode: {e}")
@@ -154,15 +162,22 @@ def classify_error(text: str) -> tuple[str, str]:
 
 # ── yt-dlp аргументы ──────────────────────────────────────────────────────────
 
-def ytdlp_base_args() -> list[str]:
+# Разные наборы клиентов — YouTube блокирует их избирательно в зависимости
+# от видео/региона/аккаунта. Если один набор не сработал — пробуем другой.
+CLIENT_SETS = [
+    "tv_embedded,web_creator,ios",
+    "web,mweb",
+    "android,ios",
+    "tv_embedded",
+]
+
+def ytdlp_base_args(client_set_index: int = 0) -> list[str]:
+    clients = CLIENT_SETS[client_set_index % len(CLIENT_SETS)]
     args = [
         "yt-dlp",
         "--no-playlist",
         "--no-warnings",
-        # Оптимальний набір клієнтів для стабільної роботи з проксі/кукі
-        # tv_embedded + web_creator — наиболее стабильные клиенты в 2026
-        # не требуют po_token и работают с cookies
-        "--extractor-args", "youtube:player_client=tv_embedded,web_creator,ios",
+        "--extractor-args", f"youtube:player_client={clients}",
     ]
     cookies_path = setup_cookies()
     if cookies_path:
@@ -178,22 +193,32 @@ def get_video_info(url: str, use_cache: bool = True) -> dict:
         with _info_cache_lock:
             cached = _info_cache.get(url)
             if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
-                print(f"[DEBUG] Info cache HIT for {url[:50]}")
-                return cached[1]
+                print(f"[DEBUG] Info cache HIT for {url[:50]} (client_index={cached[2]})")
+                result = dict(cached[1])
+                result["_client_index"] = cached[2]
+                return result
 
-    result = _fetch_video_info_uncached(url)
+    result, working_client = _fetch_video_info_uncached(url)
 
-    # Сохраняем в кеш только успешные результаты
     if "error" not in result:
         with _info_cache_lock:
-            _info_cache[url] = (time.time(), result)
+            _info_cache[url] = (time.time(), result, working_client)
+        result = dict(result)
+        result["_client_index"] = working_client
 
     return result
 
 
-def _fetch_video_info_uncached(url: str, retry: bool = True) -> dict:
+def get_cached_client_index(url: str) -> int:
+    """Возвращает индекс клиента который сработал для этого URL, или 0."""
+    with _info_cache_lock:
+        cached = _info_cache.get(url)
+        return cached[2] if cached else 0
+
+
+def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 3) -> tuple[dict, int]:
     try:
-        cmd = ytdlp_base_args() + [
+        cmd = ytdlp_base_args(client_index) + [
             "--dump-json",
             "--ignore-no-formats-error",
             url
@@ -209,6 +234,7 @@ def _fetch_video_info_uncached(url: str, retry: bool = True) -> dict:
                 if h and h >= 240 and vcodec != "none":
                     qualities.add(h)
             sorted_q = sorted(qualities, reverse=True)
+            print(f"[DEBUG] Info OK with client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}'")
             return {
                 "title":     info.get("title", "Видео"),
                 "thumbnail": info.get("thumbnail", ""),
@@ -216,26 +242,28 @@ def _fetch_video_info_uncached(url: str, retry: bool = True) -> dict:
                 "uploader":  info.get("uploader", ""),
                 "platform":  info.get("extractor_key", "").lower(),
                 "qualities": [str(q) for q in sorted_q] or ["best"],
-            }
+            }, client_index
+
+        print(f"[DEBUG] yt-dlp FAILED client_set[{client_index}]='{CLIENT_SETS[client_index % len(CLIENT_SETS)]}'")
+        print(f"[DEBUG] stderr: {r.stderr[-800:]}")
+        print(f"[DEBUG] stdout: {r.stdout[-300:]}")
 
         err_type, message = classify_error(r.stderr + r.stdout)
 
-        # Одна повторная попытка при транзиентных ошибках
-        # (сервер только проснулся, cookies не успели прогрузиться и т.п.)
-        if retry and err_type in ("unsupported", "unknown", "network"):
-            print(f"[DEBUG] Info fetch failed ({err_type}), retrying once in 2s...")
-            time.sleep(2)
-            return _fetch_video_info_uncached(url, retry=False)
+        if attempts_left > 1:
+            print(f"[DEBUG] Trying next client set, {attempts_left - 1} attempts left...")
+            time.sleep(1.5)
+            return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
 
-        return {"error": message, "error_type": err_type}
+        return {"error": message, "error_type": err_type}, client_index
 
     except subprocess.TimeoutExpired:
-        if retry:
-            time.sleep(2)
-            return _fetch_video_info_uncached(url, retry=False)
-        return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}
+        if attempts_left > 1:
+            time.sleep(1.5)
+            return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
+        return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}, client_index
     except Exception as e:
-        return {"error": str(e), "error_type": "unknown"}
+        return {"error": str(e), "error_type": "unknown"}, client_index
 
 
 # ── Задача скачивания ─────────────────────────────────────────────────────────
@@ -251,93 +279,113 @@ def download_task(task_id: str, url: str, quality: str):
         return
 
     title = info["title"]
+    # Клиент который сработал для получения инфы — используем его же для скачивания.
+    # Раньше здесь всегда брался клиент по умолчанию (индекс 0), даже если
+    # get_video_info нашёл рабочий вариант через другой клиент — из-за этого
+    # инфо получалось, а скачивание падало с "Unsupported URL".
+    working_client_index = info.get("_client_index", get_cached_client_index(url))
     update_task(task_id, title=title, step="Подготовка к загрузке…")
 
     clean_q = re.sub(r"\D", "", quality)
 
-    # ── Строим аргументы для yt-dlp ──────────────────────────────────────
-    # Используем --format-sort вместо -f с жёсткими фильтрами.
-    # format-sort работает с ЛЮБЫМ типом форматов (muxed или DASH)
-    # и сам выбирает лучшее доступное — не падает с "format not available".
-    base = ytdlp_base_args()
-
-    if clean_q and clean_q.isdigit():
-        h = int(clean_q)
-        # Выбираем лучшее видео до нужной высоты
-        # -S сортирует форматы: сначала по высоте, потом по расширению, потом кодек
-        extra_args = [
-            "--format-sort", f"res:{h},ext:mp4:m4a,+codec:avc:m4a",
-            # Ограничиваем высоту через height filter как запасной
-            "-f", f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
-        ]
-    else:
-        # best — просто сортируем по качеству
-        extra_args = [
+    def build_format_args(h: int | None) -> list[str]:
+        if h:
+            return [
+                "--format-sort", f"res:{h},ext:mp4:m4a,+codec:avc:m4a",
+                "-f", f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
+            ]
+        return [
             "--format-sort", "res,ext:mp4:m4a,+codec:avc:m4a",
             "-f", "bestvideo+bestaudio/best",
         ]
 
-    print(f"[DEBUG] quality='{quality}' clean_q='{clean_q}' extra_args={extra_args}")
-
+    height = int(clean_q) if clean_q and clean_q.isdigit() else None
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
-    cmd = base + extra_args + [
-        "--newline",
-        "--merge-output-format", "mp4",
-        # Если формат недоступен — не падать, взять что есть
-        "--ignore-no-formats-error",
-        "-o", out,
-        url,
-    ]
+    # Пробуем скачать, начиная с клиента который сработал для инфы.
+    # Если он вдруг не сработает при скачивании — перебираем остальных.
+    max_attempts = len(CLIENT_SETS)
+    last_stderr = ""
+    last_stdout_lines: list[str] = []
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stdout_lines = []
+    for attempt in range(max_attempts):
+        client_index = (working_client_index + attempt) % len(CLIENT_SETS)
+        extra_args = build_format_args(height)
 
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        stdout_lines.append(line)
+        print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
+              f"client_set[{client_index}]='{CLIENT_SETS[client_index]}' extra_args={extra_args}")
 
-        if "[download]" in line and "%" in line:
-            m_pct   = re.search(r"(\d+\.?\d*)%", line)
-            m_speed = re.search(r"at\s+([\d.]+\s*\w+/s)", line)
-            m_eta   = re.search(r"ETA\s+([\d:]+)", line)
-            m_size  = re.search(r"of\s+([\d.]+\s*\w+)", line)
+        cmd = ytdlp_base_args(client_index) + extra_args + [
+            "--newline",
+            "--merge-output-format", "mp4",
+            "--ignore-no-formats-error",
+            "-o", out,
+            url,
+        ]
 
-            if m_pct:
-                update_task(task_id, percent=min(95, float(m_pct.group(1))),
-                            status="downloading")
-            parts = []
-            if m_size:  parts.append(f"Размер: {m_size.group(1)}")
-            if m_speed: parts.append(f"Скорость: {m_speed.group(1)}")
-            if m_eta:   parts.append(f"Осталось: {m_eta.group(1)}")
-            if parts:   update_task(task_id, step=" · ".join(parts))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout_lines = []
 
-        elif "[Merger]" in line or "Merging" in line:
-            update_task(task_id, step="🔀 Объединение аудио и видео…", percent=97)
-        elif "Destination:" in line:
-            update_task(task_id, step="💾 Сохранение…")
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            stdout_lines.append(line)
 
-    stderr_out = proc.stderr.read()
-    proc.wait()
+            if "[download]" in line and "%" in line:
+                m_pct   = re.search(r"(\d+\.?\d*)%", line)
+                m_speed = re.search(r"at\s+([\d.]+\s*\w+/s)", line)
+                m_eta   = re.search(r"ETA\s+([\d:]+)", line)
+                m_size  = re.search(r"of\s+([\d.]+\s*\w+)", line)
 
-    if proc.returncode != 0:
-        err_type, message = classify_error(stderr_out + "\n".join(stdout_lines))
-        update_task(task_id, status="error", error=message, error_type=err_type,
-                    error_detail=stderr_out[-500:])
-        return
+                if m_pct:
+                    update_task(task_id, percent=min(95, float(m_pct.group(1))),
+                                status="downloading")
+                parts = []
+                if m_size:  parts.append(f"Размер: {m_size.group(1)}")
+                if m_speed: parts.append(f"Скорость: {m_speed.group(1)}")
+                if m_eta:   parts.append(f"Осталось: {m_eta.group(1)}")
+                if parts:   update_task(task_id, step=" · ".join(parts))
 
-    files = list(TMP_DIR.glob(f"{task_id}_*"))
-    if not files:
-        update_task(task_id, status="error",
-                    error="⚠️ Файл не создан", error_type="unknown")
-        return
+            elif "[Merger]" in line or "Merging" in line:
+                update_task(task_id, step="🔀 Объединение аудио и видео…", percent=97)
+            elif "Destination:" in line:
+                update_task(task_id, step="💾 Сохранение…")
 
-    vp = max(files, key=lambda f: f.stat().st_size)
-    update_task(task_id, status="done", percent=100, step="✓ Готово!",
-                file_path=str(vp), filename=vp.name, file_size=vp.stat().st_size)
+        stderr_out = proc.stderr.read()
+        proc.wait()
+
+        if proc.returncode == 0:
+            files = list(TMP_DIR.glob(f"{task_id}_*"))
+            if files:
+                vp = max(files, key=lambda f: f.stat().st_size)
+                update_task(task_id, status="done", percent=100, step="✓ Готово!",
+                            file_path=str(vp), filename=vp.name, file_size=vp.stat().st_size)
+                return
+            # returncode 0 но файла нет — считаем неудачей и пробуем следующего клиента
+            last_stderr = "Файл не был создан после успешного завершения yt-dlp"
+            last_stdout_lines = stdout_lines
+        else:
+            last_stderr = stderr_out
+            last_stdout_lines = stdout_lines
+            print(f"[DEBUG] Download attempt {attempt+1} FAILED (client_set[{client_index}])")
+            print(f"[DEBUG] stderr: {stderr_out[-800:]}")
+
+        # Если ошибка явно не про клиента (например, приватное видео, авторские права) —
+        # нет смысла пробовать другие клиенты, сразу выходим
+        err_type, _ = classify_error(stderr_out + "\n".join(stdout_lines))
+        if err_type in ("private", "age_restricted", "geo_blocked", "not_found", "copyright"):
+            break
+
+        # Иначе пробуем следующий набор клиентов
+        if attempt < max_attempts - 1:
+            time.sleep(1.5)
+
+    # Все попытки исчерпаны
+    err_type, message = classify_error(last_stderr + "\n".join(last_stdout_lines))
+    update_task(task_id, status="error", error=message, error_type=err_type,
+                error_detail=last_stderr[-500:])
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -364,7 +412,9 @@ def api_info():
     result = get_video_info(url)
     if "error" in result:
         return jsonify(result), 400
-    return jsonify(result)
+    # _client_index — служебное поле, не отдаём его в API-ответе
+    public_result = {k: v for k, v in result.items() if not k.startswith("_")}
+    return jsonify(public_result)
 
 
 @app.post("/api/download")
