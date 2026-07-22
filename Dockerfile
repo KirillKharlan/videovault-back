@@ -1,7 +1,16 @@
 FROM python:3.11-slim
 
-# ffmpeg нужен для склейки аудио+видео
-RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
+# ffmpeg — склейка аудио+видео
+# curl — установка Deno
+RUN apt-get update && apt-get install -y ffmpeg curl unzip && rm -rf /var/lib/apt/lists/*
+
+# Deno — JS-движок, ОБЯЗАТЕЛЕН для yt-dlp >= 2026.x
+# Без него YouTube-экстрактор не может расшифровать сигнатуры видео и
+# падает с ошибкой "Failed to extract any player response" на ЛЮБОМ клиенте.
+RUN curl -fsSL https://deno.land/install.sh | sh -s -- -y \
+    && mv /root/.deno/bin/deno /usr/local/bin/deno \
+    && chmod +x /usr/local/bin/deno \
+    && deno --version
 
 WORKDIR /app
 

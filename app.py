@@ -421,8 +421,17 @@ def health():
         ytdlp_ver = r.stdout.strip()
     except Exception:
         ytdlp_ver = "not found"
+
+    try:
+        r = subprocess.run(["deno", "--version"],
+                           capture_output=True, text=True, timeout=5)
+        deno_ver = r.stdout.strip().split("\n")[0] if r.returncode == 0 else "ERROR"
+    except Exception:
+        deno_ver = "NOT FOUND — YouTube extraction will fail!"
+
     has_cookies = COOKIES_FILE.exists()
     return jsonify({"ok": True, "yt_dlp_version": ytdlp_ver,
+                    "deno_version": deno_ver,
                     "cookies": has_cookies,
                     "tasks": len(load_tasks())})
 
