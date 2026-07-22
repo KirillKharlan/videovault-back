@@ -167,11 +167,19 @@ def classify_error(text: str) -> tuple[str, str]:
 # данные ДАЖЕ ПРИ returncode==0 (без явной ошибки) — поэтому у нас есть
 # варианты без cookies как fallback, а не только разные клиенты.
 CLIENT_ATTEMPTS: list[tuple[str, bool]] = [
-    ("ios", True),
-    ("android", True),
-    ("ios", False),          # без cookies — на случай если они "портят" ответ
-    ("web,mweb", False),
-    ("tv_embedded", False),
+    # ВАЖНО: проверено в исходниках yt-dlp (yt_dlp/extractor/youtube/_base.py,
+    # INNERTUBE_CLIENTS) — какие клиенты вообще поддерживают cookies:
+    #   SUPPORTS_COOKIES=True:  web, web_safari, web_embedded, tv, tv_downgraded
+    #   SUPPORTS_COOKIES=False: ios, android, mweb, tv_simply, web_creator
+    # Раньше мы отправляли cookies клиентам ios/android, которые их вообще
+    # не поддерживают — это и вызывало "Failed to extract any player response"
+    # на КАЖДОМ запросе с cookies. Теперь cookies идут только туда, где
+    # клиент их официально поддерживает.
+    ("web", True),           # веб-клиент + личный аккаунт — основной вариант
+    ("tv", True),            # TV-клиент тоже поддерживает cookies — запасной
+    ("ios", False),          # мобильные клиенты — ТОЛЬКО анонимно, cookies не поддерживают
+    ("android", False),
+    ("mweb", False),
 ]
 
 def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
@@ -392,7 +400,7 @@ def download_task(task_id: str, url: str, quality: str):
         else:
             last_stderr = stderr_out
             last_stdout_lines = stdout_lines
-            print(f"[DEBUG] Download attempt {attempt+1} FAILED (client_set[{client_index}])")
+            print(f"[DEBUG] Download attempt {attempt+1} FAILED (attempt_index[{client_index}]={CLIENT_ATTEMPTS[client_index]})")
             print(f"[DEBUG] stderr: {stderr_out[-800:]}")
 
         # Если ошибка явно не про клиента (например, приватное видео, авторские права) —
