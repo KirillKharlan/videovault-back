@@ -171,15 +171,26 @@ CLIENT_ATTEMPTS: list[tuple[str, bool]] = [
     # INNERTUBE_CLIENTS) — какие клиенты вообще поддерживают cookies:
     #   SUPPORTS_COOKIES=True:  web, web_safari, web_embedded, tv, tv_downgraded
     #   SUPPORTS_COOKIES=False: ios, android, mweb, tv_simply, web_creator
-    # Раньше мы отправляли cookies клиентам ios/android, которые их вообще
-    # не поддерживают — это и вызывало "Failed to extract any player response"
-    # на КАЖДОМ запросе с cookies. Теперь cookies идут только туда, где
-    # клиент их официально поддерживает.
-    ("web", True),           # веб-клиент + личный аккаунт — основной вариант
-    ("tv", True),            # TV-клиент тоже поддерживает cookies — запасной
-    ("ios", False),          # мобильные клиенты — ТОЛЬКО анонимно, cookies не поддерживают
+    #
+    # ОБНОВЛЕНИЕ: локальный тест yt-dlp с текущими cookies дал явное
+    # предупреждение: "The provided YouTube account cookies are no longer
+    # valid. They have likely been rotated in the browser as a security
+    # measure." — Google аннулирует cookies личного аккаунта при
+    # использовании с другого IP (сервер), считая это угоном сессии.
+    # Поэтому cookies сейчас НЕ помогают, а вредят — комбинация
+    # "протухшая сессия + IP дата-центра" выглядит подозрительнее чем
+    # анонимный запрос. Анонимные клиенты (без cookies) теперь идут первыми.
+    # Deno установлен и подтверждён (>= 2.3.0 minimum) — расшифровка подписей
+    # должна работать сама по себе для большинства обычных публичных видео.
+    ("ios", False),
     ("android", False),
     ("mweb", False),
+    ("web", False),
+    ("tv", False),
+    # Cookies оставлены в самом конце — вдруг когда-нибудь будут обновлены
+    # свежими. Пока рабочего эффекта от них ждать не стоит.
+    ("web", True),
+    ("tv", True),
 ]
 
 def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
@@ -228,7 +239,9 @@ def get_cached_client_index(url: str) -> int:
         return cached[2] if cached else 0
 
 
-def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int = 5) -> tuple[dict, int]:
+def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int | None = None) -> tuple[dict, int]:
+    if attempts_left is None:
+        attempts_left = len(CLIENT_ATTEMPTS)
     try:
         cmd = ytdlp_base_args(client_index) + [
             "--dump-json",
@@ -253,12 +266,24 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
                   f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
 
+            is_poor_data = not sorted_q and duration == 0
+            if is_poor_data:
+                # Печатаем ПОЧЕМУ именно нет форматов — вместо гадания.
+                # Эти поля прямо говорят о причине: возрастное ограничение,
+                # региональная блокировка, стрим, премьера, платный контент и т.д.
+                print(f"[DEBUG] Poor-data diagnostics for this video:")
+                print(f"[DEBUG]   age_limit: {info.get('age_limit')}")
+                print(f"[DEBUG]   availability: {info.get('availability')}")
+                print(f"[DEBUG]   is_live: {info.get('is_live')}")
+                print(f"[DEBUG]   live_status: {info.get('live_status')}")
+                print(f"[DEBUG]   requires_premium: {info.get('requires_premium')}")
+                print(f"[DEBUG]   playable_in_embed: {info.get('playable_in_embed')}")
+
             # Клиент ответил, но реальных данных почти нет (0 форматов, 0 длительность).
             # Может быть из-за YouTube Shorts С определёнными клиентами, ИЛИ из-за
             # просроченных/повреждённых cookies (см. CLIENT_ATTEMPTS — там есть
             # варианты и с cookies, и без). Считаем неудачей и пробуем следующую
             # комбинацию если попытки ещё остались.
-            is_poor_data = not sorted_q and duration == 0
             if is_poor_data and attempts_left > 1:
                 print(f"[DEBUG] Poor data (no formats, duration=0) — trying next attempt")
                 time.sleep(1.0)
