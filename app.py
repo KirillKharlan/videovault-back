@@ -205,6 +205,21 @@ def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
         cookies_path = setup_cookies()
         if cookies_path:
             args += ["--cookies", cookies_path]
+
+    # ── Прокси ────────────────────────────────────────────────────────────
+    # Эмпирически подтверждено (см. логи): ВСЕ комбинации клиентов и cookies
+    # дают пустые данные (raw_formats_count=0, duration=0, почти все метаданные
+    # None) — для абсолютно любого видео. Это не поведение конкретного клиента,
+    # а признак того, что сам IP сервера Render заблокирован YouTube на сетевом
+    # уровне (датацентровые IP массово используются для скрейпинга и попадают
+    # в чёрные списки). Единственный выход — маршрутизировать запросы через
+    # прокси с обычным (не датацентровым) IP.
+    #
+    # Формат: http://user:pass@host:port  или  socks5://user:pass@host:port
+    proxy_url = os.environ.get("YT_PROXY", "").strip()
+    if proxy_url:
+        args += ["--proxy", proxy_url]
+
     return args
 
 
@@ -463,9 +478,11 @@ def health():
         deno_ver = "NOT FOUND — YouTube extraction will fail!"
 
     has_cookies = COOKIES_FILE.exists()
+    has_proxy = bool(os.environ.get("YT_PROXY", "").strip())
     return jsonify({"ok": True, "yt_dlp_version": ytdlp_ver,
                     "deno_version": deno_ver,
                     "cookies": has_cookies,
+                    "proxy_configured": has_proxy,
                     "tasks": len(load_tasks())})
 
 
