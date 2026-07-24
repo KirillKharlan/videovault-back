@@ -193,6 +193,25 @@ CLIENT_ATTEMPTS: list[tuple[str, bool]] = [
     ("tv", True),
 ]
 
+# ── Пул прокси ──────────────────────────────────────────────────────────────
+# Поддержка нескольких прокси-аккаунтов (например, 3 бесплатных Webshare
+# аккаунта по ~1GB каждый = суммарно больше трафика).
+#
+# Настройка на Render — переменная окружения YT_PROXIES, через запятую:
+#   YT_PROXIES=http://user1:pass1@ip1:port1,http://user2:pass2@ip2:port2,http://user3:pass3@ip3:port3
+#
+# Обратная совместимость: если YT_PROXIES не задана, но задана старая
+# одиночная YT_PROXY — используется она одна.
+def _load_proxy_pool() -> list[str]:
+    multi = os.environ.get("YT_PROXIES", "").strip()
+    if multi:
+        return [p.strip() for p in multi.split(",") if p.strip()]
+    single = os.environ.get("YT_PROXY", "").strip()
+    return [single] if single else []
+
+PROXY_POOL: list[str] = _load_proxy_pool()
+
+
 def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
     clients, use_cookies = CLIENT_ATTEMPTS[attempt_index % len(CLIENT_ATTEMPTS)]
     args = [
@@ -207,17 +226,16 @@ def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
             args += ["--cookies", cookies_path]
 
     # ── Прокси ────────────────────────────────────────────────────────────
-    # Эмпирически подтверждено (см. логи): ВСЕ комбинации клиентов и cookies
-    # дают пустые данные (raw_formats_count=0, duration=0, почти все метаданные
-    # None) — для абсолютно любого видео. Это не поведение конкретного клиента,
-    # а признак того, что сам IP сервера Render заблокирован YouTube на сетевом
-    # уровне (датацентровые IP массово используются для скрейпинга и попадают
-    # в чёрные списки). Единственный выход — маршрутизировать запросы через
-    # прокси с обычным (не датацентровым) IP.
+    # Эмпирически подтверждено: IP сервера Render заблокирован YouTube на
+    # сетевом уровне. Прокси с обычным (не датацентровым) IP решает проблему.
     #
-    # Формат: http://user:pass@host:port  или  socks5://user:pass@host:port
-    proxy_url = os.environ.get("YT_PROXY", "").strip()
-    if proxy_url:
+    # Ротация: если задано несколько прокси (YT_PROXIES), выбираем прокси по
+    # attempt_index — это значит, что при каждой повторной попытке (перебор
+    # клиентов из CLIENT_ATTEMPTS) параллельно меняется и прокси. Так мы
+    # одновременно перебираем и клиентов, и прокси-аккаунты, не тратя лишние
+    # запросы на отдельную матрицу комбинаций.
+    if PROXY_POOL:
+        proxy_url = PROXY_POOL[attempt_index % len(PROXY_POOL)]
         args += ["--proxy", proxy_url]
 
     return args
@@ -278,7 +296,9 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             duration = int(info.get("duration") or 0)
 
             # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
+            proxy_used = PROXY_POOL[client_index % len(PROXY_POOL)] if PROXY_POOL else "none"
             print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
+                  f"proxy={proxy_used[:30]}... "
                   f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
 
             is_poor_data = not sorted_q and duration == 0
@@ -478,11 +498,10 @@ def health():
         deno_ver = "NOT FOUND — YouTube extraction will fail!"
 
     has_cookies = COOKIES_FILE.exists()
-    has_proxy = bool(os.environ.get("YT_PROXY", "").strip())
     return jsonify({"ok": True, "yt_dlp_version": ytdlp_ver,
                     "deno_version": deno_ver,
                     "cookies": has_cookies,
-                    "proxy_configured": has_proxy,
+                    "proxy_count": len(PROXY_POOL),
                     "tasks": len(load_tasks())})
 
 
