@@ -104,6 +104,35 @@ def setup_cookies() -> str | None:
 setup_cookies()  # Записываем cookies при старте
 
 
+def reconcile_stale_tasks():
+    """
+    Вызывается один раз при старте процесса (импорт модуля — значит,
+    сработает и при полном рестарте, И при том, что gunicorn arbiter
+    молча респавнит воркер после его смерти, например от OOM).
+
+    Любая задача, оставшаяся в незавершённом статусе (queued/fetching_info/
+    downloading), физически не может быть продолжена — процесс, который её
+    выполнял, больше не существует. Раньше в этом случае /api/progress
+    бесконечно отдавал старый статус "downloading 43%", и приложение
+    зависало без объяснений. Теперь сразу помечаем такие задачи ошибкой
+    с понятной причиной.
+    """
+    with _tasks_lock:
+        tasks = load_tasks()
+        changed = False
+        for tid, t in tasks.items():
+            if t.get("status") in ("queued", "fetching_info", "downloading"):
+                t["status"] = "error"
+                t["error"] = "🔄 Сервер перезапустился во время загрузки — нажмите «Скачать» ещё раз"
+                t["error_type"] = "server_restart"
+                changed = True
+        if changed:
+            print(f"[startup] Reconciled {sum(1 for t in tasks.values() if t.get('error_type') == 'server_restart')} stale task(s)")
+            save_tasks(tasks)
+
+reconcile_stale_tasks()
+
+
 # ── Очистка старых файлов ─────────────────────────────────────────────────────
 
 def cleanup_loop():
@@ -192,6 +221,24 @@ CLIENT_ATTEMPTS: list[tuple[str, bool]] = [
     ("web", True),
     ("tv", True),
 ]
+
+# ── Лестница качества для fallback при OOM ────────────────────────────────────
+# Free-тариф Render — 512MB RAM. Если yt-dlp/ffmpeg убиты сигналом (похоже на
+# OOM), помимо смены клиента имеет смысл ещё и понизить целевое разрешение —
+# это не даёт гарантии, но заметно снижает пиковую память на слиянии
+# видео+аудио для тяжёлых (4K/1440p) исходников.
+QUALITY_LADDER = [2160, 1440, 1080, 720, 480, 360, 240]
+
+def _next_lower_quality(h: int | None) -> int | None:
+    """Следующая по списку более низкая ступень качества, либо None если
+    дальше понижать некуда (h уже минимальный)."""
+    if h is None:
+        # "best" может резолвиться в 4K/8K — сразу ставим потолок 1080p
+        return 1080
+    for q in QUALITY_LADDER:
+        if q < h:
+            return q
+    return None
 
 # ── Пул прокси ──────────────────────────────────────────────────────────────
 # Поддержка нескольких прокси-аккаунтов (например, 3 бесплатных Webshare
@@ -399,6 +446,7 @@ def download_task(task_id: str, url: str, quality: str):
     max_attempts = len(CLIENT_ATTEMPTS)
     last_stderr = ""
     last_stdout_lines: list[str] = []
+    was_killed_by_signal = False
 
     for attempt in range(max_attempts):
         client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
@@ -411,6 +459,9 @@ def download_task(task_id: str, url: str, quality: str):
             "--newline",
             "--merge-output-format", "mp4",
             "--ignore-no-formats-error",
+            # Ограничиваем потоки ffmpeg на слиянии — на free-тарифе Render
+            # (512MB RAM, общий CPU) это немного снижает пиковую нагрузку.
+            "--postprocessor-args", "ffmpeg:-threads 1",
             "-o", out,
             url,
         ]
@@ -463,6 +514,21 @@ def download_task(task_id: str, url: str, quality: str):
             print(f"[DEBUG] Download attempt {attempt+1} FAILED (attempt_index[{client_index}]={CLIENT_ATTEMPTS[client_index]})")
             print(f"[DEBUG] stderr: {stderr_out[-800:]}")
 
+            # returncode < 0 значит процесс убит сигналом (например SIGKILL от
+            # OOM killer), а не завершился с обычной ошибкой yt-dlp. stderr в
+            # этом случае почти всегда пустой — classify_error() ничего
+            # осмысленного не найдёт. Понижаем целевое качество и пробуем
+            # следующую попытку с ним — это не гарантия, но для тяжёлых
+            # (4K/1440p) исходников заметно снижает риск повторного OOM.
+            if proc.returncode is not None and proc.returncode < 0:
+                was_killed_by_signal = True
+                lower = _next_lower_quality(height)
+                print(f"[DEBUG] Process killed by signal {proc.returncode} — "
+                      f"looks like OOM. Lowering quality {height} → {lower}")
+                if lower is not None:
+                    height = lower
+                    update_task(task_id, step=f"⚠️ Не хватило ресурсов — пробуем качество ≤{height}p…")
+
         # Если ошибка явно не про клиента (например, приватное видео, авторские права) —
         # нет смысла пробовать другие клиенты, сразу выходим
         err_type, _ = classify_error(stderr_out + "\n".join(stdout_lines))
@@ -474,7 +540,16 @@ def download_task(task_id: str, url: str, quality: str):
             time.sleep(1.5)
 
     # Все попытки исчерпаны
-    err_type, message = classify_error(last_stderr + "\n".join(last_stdout_lines))
+    if was_killed_by_signal and not last_stderr.strip():
+        # Все неудачи были сигнальными убийствами процесса (OOM-подобное), а
+        # содержательного stderr для classify_error() нет — даём понятное
+        # сообщение вместо generic "⚠️ Ошибка: " с пустым текстом.
+        err_type, message = "resource", (
+            "💾 Серверу не хватило памяти на это видео даже на низком качестве. "
+            "Попробуйте ещё раз чуть позже или выберите более короткое видео."
+        )
+    else:
+        err_type, message = classify_error(last_stderr + "\n".join(last_stdout_lines))
     update_task(task_id, status="error", error=message, error_type=err_type,
                 error_detail=last_stderr[-500:])
 
