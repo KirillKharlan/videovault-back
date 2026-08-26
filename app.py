@@ -170,6 +170,11 @@ threading.Thread(target=cleanup_loop, daemon=True).start()
 # ── Классификатор ошибок ──────────────────────────────────────────────────────
 
 ERROR_PATTERNS = [
+    (["cookies are no longer valid", "no longer valid", "cookies have expired",
+      "cookies are invalid"],
+     "cookies_expired",
+     "🍪 Куки для YouTube протухли/отозваны — нужно переэкспортировать "
+     "свежие из залогиненного браузера и обновить YT_COOKIES_B64"),
     (["sign in to confirm", "confirm you're not a bot", "bot detection"],
      "bot", "🤖 YouTube требует авторизацию — нужно настроить cookies"),
     (["failed to extract any player response", "player response"],
@@ -362,9 +367,14 @@ def ytdlp_base_args(attempt_index: int = 0) -> tuple[list[str], str | None]:
     args = [
         "yt-dlp",
         "--no-playlist",
-        "--no-warnings",
         "--extractor-args", f"youtube:player_client={clients}",
     ]
+    # ── --no-warnings убран сознательно ──────────────────────────────────
+    # Раньше он скрывал важные предупреждения от yt-dlp (например "The
+    # provided YouTube account cookies are no longer valid") даже в обычном
+    # (не verbose) режиме — из-за этого причину сбоя было видно только с
+    # DEBUG_VERBOSE=1. Теперь такие WARNING всегда попадают в stderr и
+    # classify_error() их распознаёт (см. паттерн "cookies_expired" ниже).
     if DEBUG_VERBOSE:
         # --verbose печатает полный трейс: player response, nsig/PO token,
         # выбор клиента, HTTP-запросы — то, что скрыто в обычном режиме.
