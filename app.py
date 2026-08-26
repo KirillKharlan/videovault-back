@@ -6,6 +6,17 @@ Fixes:
 """
 
 import os, json, threading, subprocess, time, uuid, tempfile, re, base64
+
+# ── Режим подробной диагностики ─────────────────────────────────────────────
+# Включается переменной окружения DEBUG_VERBOSE=1 на Render (Environment →
+# добавить переменную, затем redeploy). Добавляет --verbose к yt-dlp и
+# печатает значительно больше stderr/stdout в логи — видно, на каком именно
+# шаге падает извлечение (player response, nsig/PO token, парсинг форматов
+# и т.д.), а не только финальное "No video formats found!".
+# ВАЖНО: после диагностики стоит выключить (убрать переменную или поставить
+# 0) — verbose режим сильно шумит в логах и чуть медленнее.
+DEBUG_VERBOSE = os.environ.get("DEBUG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+_LOG_TAIL_CHARS = 6000 if DEBUG_VERBOSE else 800
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
@@ -179,6 +190,8 @@ ERROR_PATTERNS = [
      "unsupported", "❌ Эта ссылка не поддерживается"),
     (["urlopen error", "connection", "timed out"],
      "network", "📡 Ошибка сети"),
+    (["402 payment required", "payment required", "tunnel connection failed: 402"],
+     "proxy_quota", "💳 У прокси-аккаунта закончился лимит трафика"),
 ]
 
 def classify_error(text: str) -> tuple[str, str]:
@@ -259,7 +272,92 @@ def _load_proxy_pool() -> list[str]:
 PROXY_POOL: list[str] = _load_proxy_pool()
 
 
-def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
+def _proxy_account(proxy_url: str) -> str:
+    """Достаём 'аккаунт' прокси из URL — это username в http://user:pass@host:port.
+    У нас несколько IP делят один и тот же аккаунт/лимит трафика (например
+    3 прокси-провайдера по несколько IP каждый), так что 402 на одном IP
+    аккаунта означает, что лимит исчерпан у ВСЕХ его IP."""
+    try:
+        creds = proxy_url.split("://", 1)[1].split("@", 1)[0]
+        return creds.split(":", 1)[0]
+    except (IndexError, ValueError):
+        return proxy_url  # fallback — считаем весь URL уникальным "аккаунтом"
+
+
+# ── Учёт истощённых прокси-аккаунтов (402 Payment Required) ────────────────
+# Лимиты трафика у бесплатных прокси-провайдеров обычно обнуляются раз в
+# месяц. Храним время, когда аккаунт был помечен как исчерпанный, и просто
+# перестаём его предлагать на PROXY_DEAD_COOLDOWN_SECONDS — вместо того чтобы
+# тратить retry-попытки на заведомо мёртвые IP этого аккаунта.
+PROXY_DEAD_COOLDOWN_SECONDS = 6 * 3600  # 6 часов; на 402 быстро не воскресает
+_dead_proxy_accounts: dict[str, float] = {}
+_dead_proxy_lock = threading.Lock()
+
+
+def mark_proxy_account_dead(proxy_url: str) -> None:
+    account = _proxy_account(proxy_url)
+    with _dead_proxy_lock:
+        already_dead = account in _dead_proxy_accounts
+        _dead_proxy_accounts[account] = time.time()
+    if not already_dead:
+        print(f"[DEBUG] Proxy account '{account}' помечен как исчерпанный (402) — "
+              f"пропускаем на {PROXY_DEAD_COOLDOWN_SECONDS // 3600}ч")
+
+
+def _is_account_dead(account: str) -> bool:
+    with _dead_proxy_lock:
+        died_at = _dead_proxy_accounts.get(account)
+    if died_at is None:
+        return False
+    if time.time() - died_at > PROXY_DEAD_COOLDOWN_SECONDS:
+        # Cooldown истёк — даём аккаунту ещё один шанс.
+        with _dead_proxy_lock:
+            _dead_proxy_accounts.pop(account, None)
+        return False
+    return True
+
+
+# ── Независимая ротация прокси ──────────────────────────────────────────────
+# Раньше индекс прокси совпадал с индексом клиента (attempt_index), а этот
+# индекс каждый раз стартовал с 0 для НОВОГО видео. При 12 прокси и 7
+# клиентах (CLIENT_ATTEMPTS) это значило, что прокси с позициями 7-11 в
+# пуле не использовались вообще НИКОГДА, ни для одного запроса — не в
+# рамках одной попытки, а вообще, потому что счётчик не переживал между
+# запросами. Чтобы весь пул реально работал, ротацию прокси делаем сквозной:
+# глобальный счётчик увеличивается на каждый вызов select_proxy(), не
+# сбрасываясь между разными видео/запросами. Так за несколько запросов
+# гарантированно проходим по всем прокси пула по кругу, а не только по
+# первым len(CLIENT_ATTEMPTS) из них.
+_proxy_rotation_index = 0
+_proxy_rotation_lock = threading.Lock()
+
+
+def _next_proxy_start_index() -> int:
+    global _proxy_rotation_index
+    with _proxy_rotation_lock:
+        idx = _proxy_rotation_index
+        _proxy_rotation_index += 1
+    return idx
+
+
+def select_proxy() -> str | None:
+    """Выбирает следующий прокси по сквозной ротации (независимо от того,
+    какой клиент/попытка сейчас перебирается), пропуская аккаунты с
+    недавним 402 (исчерпанный лимит). Если все аккаунты мертвы — best-effort:
+    всё равно возвращает прокси по кругу (вдруг классификация ошиблась)."""
+    if not PROXY_POOL:
+        return None
+    n = len(PROXY_POOL)
+    start = _next_proxy_start_index()
+    for i in range(n):
+        candidate = PROXY_POOL[(start + i) % n]
+        if not _is_account_dead(_proxy_account(candidate)):
+            return candidate
+    # Все аккаунты мертвы — не блокируем работу совсем, пробуем как есть.
+    return PROXY_POOL[start % n]
+
+
+def ytdlp_base_args(attempt_index: int = 0) -> tuple[list[str], str | None]:
     clients, use_cookies = CLIENT_ATTEMPTS[attempt_index % len(CLIENT_ATTEMPTS)]
     args = [
         "yt-dlp",
@@ -267,6 +365,10 @@ def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
         "--no-warnings",
         "--extractor-args", f"youtube:player_client={clients}",
     ]
+    if DEBUG_VERBOSE:
+        # --verbose печатает полный трейс: player response, nsig/PO token,
+        # выбор клиента, HTTP-запросы — то, что скрыто в обычном режиме.
+        args += ["--verbose"]
     if use_cookies:
         cookies_path = setup_cookies()
         if cookies_path:
@@ -276,16 +378,17 @@ def ytdlp_base_args(attempt_index: int = 0) -> list[str]:
     # Эмпирически подтверждено: IP сервера Render заблокирован YouTube на
     # сетевом уровне. Прокси с обычным (не датацентровым) IP решает проблему.
     #
-    # Ротация: если задано несколько прокси (YT_PROXIES), выбираем прокси по
-    # attempt_index — это значит, что при каждой повторной попытке (перебор
-    # клиентов из CLIENT_ATTEMPTS) параллельно меняется и прокси. Так мы
-    # одновременно перебираем и клиентов, и прокси-аккаунты, не тратя лишние
-    # запросы на отдельную матрицу комбинаций.
-    if PROXY_POOL:
-        proxy_url = PROXY_POOL[attempt_index % len(PROXY_POOL)]
+    # Ротация прокси НЕЗАВИСИМА от индекса клиента (attempt_index): она
+    # использует сквозной глобальный счётчик (см. select_proxy), чтобы за
+    # разные запросы реально перебирался весь пул, а не только первые
+    # len(CLIENT_ATTEMPTS) прокси из него. Также пропускает аккаунты с
+    # исчерпанным лимитом. Возвращаем и сам URL — вызывающий код должен
+    # передать его в mark_proxy_account_dead(), если попытка упадёт с 402.
+    proxy_url = select_proxy()
+    if proxy_url:
         args += ["--proxy", proxy_url]
 
-    return args
+    return args, proxy_url
 
 
 # ── Получение информации о видео ──────────────────────────────────────────────
@@ -323,7 +426,8 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
     if attempts_left is None:
         attempts_left = len(CLIENT_ATTEMPTS)
     try:
-        cmd = ytdlp_base_args(client_index) + [
+        base_args, proxy_used = ytdlp_base_args(client_index)
+        cmd = base_args + [
             "--dump-json",
             "--ignore-no-formats-error",
             url
@@ -343,7 +447,6 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             duration = int(info.get("duration") or 0)
 
             # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
-            proxy_used = PROXY_POOL[client_index % len(PROXY_POOL)] if PROXY_POOL else "none"
             print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
                   f"proxy={proxy_used[:30]}... "
                   f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
@@ -383,10 +486,12 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             }, client_index
 
         print(f"[DEBUG] yt-dlp FAILED attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}")
-        print(f"[DEBUG] stderr: {r.stderr[-800:]}")
-        print(f"[DEBUG] stdout: {r.stdout[-300:]}")
+        print(f"[DEBUG] stderr: {r.stderr[-_LOG_TAIL_CHARS:]}")
+        print(f"[DEBUG] stdout: {r.stdout[-_LOG_TAIL_CHARS:]}")
 
         err_type, message = classify_error(r.stderr + r.stdout)
+        if err_type == "proxy_quota" and proxy_used:
+            mark_proxy_account_dead(proxy_used)
 
         if attempts_left > 1:
             print(f"[DEBUG] Trying next client set, {attempts_left - 1} attempts left...")
@@ -455,7 +560,8 @@ def download_task(task_id: str, url: str, quality: str):
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
               f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} extra_args={extra_args}")
 
-        cmd = ytdlp_base_args(client_index) + extra_args + [
+        base_args, proxy_used = ytdlp_base_args(client_index)
+        cmd = base_args + extra_args + [
             "--newline",
             "--merge-output-format", "mp4",
             "--ignore-no-formats-error",
@@ -512,7 +618,11 @@ def download_task(task_id: str, url: str, quality: str):
             last_stderr = stderr_out
             last_stdout_lines = stdout_lines
             print(f"[DEBUG] Download attempt {attempt+1} FAILED (attempt_index[{client_index}]={CLIENT_ATTEMPTS[client_index]})")
-            print(f"[DEBUG] stderr: {stderr_out[-800:]}")
+            print(f"[DEBUG] stderr: {stderr_out[-_LOG_TAIL_CHARS:]}")
+
+            _err_type, _ = classify_error(stderr_out)
+            if _err_type == "proxy_quota" and proxy_used:
+                mark_proxy_account_dead(proxy_used)
 
             # returncode < 0 значит процесс убит сигналом (например SIGKILL от
             # OOM killer), а не завершился с обычной ошибкой yt-dlp. stderr в
@@ -573,10 +683,19 @@ def health():
         deno_ver = "NOT FOUND — YouTube extraction will fail!"
 
     has_cookies = COOKIES_FILE.exists()
+    with _dead_proxy_lock:
+        dead_accounts = {
+            acc: round(PROXY_DEAD_COOLDOWN_SECONDS - (time.time() - died_at))
+            for acc, died_at in _dead_proxy_accounts.items()
+            if time.time() - died_at <= PROXY_DEAD_COOLDOWN_SECONDS
+        }
     return jsonify({"ok": True, "yt_dlp_version": ytdlp_ver,
                     "deno_version": deno_ver,
                     "cookies": has_cookies,
+                    "debug_verbose": DEBUG_VERBOSE,
                     "proxy_count": len(PROXY_POOL),
+                    "proxy_rotation_position": _proxy_rotation_index % len(PROXY_POOL) if PROXY_POOL else 0,
+                    "proxy_accounts_on_cooldown": dead_accounts,  # {username: seconds_left}
                     "tasks": len(load_tasks())})
 
 
