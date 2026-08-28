@@ -540,6 +540,7 @@ def download_task(task_id: str, url: str, quality: str):
     update_task(task_id, title=title, step="Подготовка к загрузке…")
 
     clean_q = re.sub(r"\D", "", quality)
+    is_audio_only = quality.strip().lower() in ("mp3", "audio", "audio_only")
 
     def build_format_args(h: int | None) -> list[str]:
         if h:
@@ -550,6 +551,12 @@ def download_task(task_id: str, url: str, quality: str):
         return [
             "--format-sort", "res,ext:mp4:m4a,+codec:avc:m4a",
             "-f", "bestvideo+bestaudio/best",
+        ]
+
+    def build_audio_args() -> list[str]:
+        return [
+            "-f", "bestaudio/best",
+            "-x", "--audio-format", "mp3", "--audio-quality", "0",
         ]
 
     height = int(clean_q) if clean_q and clean_q.isdigit() else None
@@ -565,22 +572,25 @@ def download_task(task_id: str, url: str, quality: str):
 
     for attempt in range(max_attempts):
         client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
-        extra_args = build_format_args(height)
+        extra_args = build_audio_args() if is_audio_only else build_format_args(height)
 
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
               f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} extra_args={extra_args}")
 
         base_args, proxy_used = ytdlp_base_args(client_index)
-        cmd = base_args + extra_args + [
+        base_cmd = base_args + extra_args + [
             "--newline",
-            "--merge-output-format", "mp4",
             "--ignore-no-formats-error",
-            # Ограничиваем потоки ffmpeg на слиянии — на free-тарифе Render
-            # (512MB RAM, общий CPU) это немного снижает пиковую нагрузку.
+            # Ограничиваем потоки ffmpeg на слиянии/конвертации — на free-тарифе
+            # Render (512MB RAM, общий CPU) это немного снижает пиковую нагрузку.
             "--postprocessor-args", "ffmpeg:-threads 1",
-            "-o", out,
-            url,
         ]
+        if not is_audio_only:
+            # --merge-output-format имеет смысл только когда реально сливаем
+            # видео+аудио дорожки; для -x (извлечение аудио) он не нужен —
+            # yt-dlp сам определяет итоговое расширение (.mp3).
+            base_cmd += ["--merge-output-format", "mp4"]
+        cmd = base_cmd + ["-o", out, url]
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout_lines = []
@@ -751,8 +761,10 @@ def api_file(task_id):
     fp = task.get("file_path")
     if not fp or not Path(fp).exists():
         abort(404)
-    return send_file(fp, mimetype="video/mp4", as_attachment=True,
-                     download_name=task.get("filename", "video.mp4"))
+    filename = task.get("filename", "video.mp4")
+    is_mp3 = filename.lower().endswith(".mp3")
+    mimetype = "audio/mpeg" if is_mp3 else "video/mp4"
+    return send_file(fp, mimetype=mimetype, as_attachment=True, download_name=filename)
 
 
 if __name__ == "__main__":
