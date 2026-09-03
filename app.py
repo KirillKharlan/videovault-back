@@ -576,7 +576,7 @@ def download_task(task_id: str, url: str, quality: str):
     #
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
-    max_attempts = len(CLIENT_ATTEMPTS) * 2
+    max_attempts = len(CLIENT_ATTEMPTS) * 9
     last_stderr = ""
     last_stdout_lines: list[str] = []
     was_killed_by_signal = False
