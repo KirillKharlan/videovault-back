@@ -397,31 +397,6 @@ def get_video_info(url: str, use_cache: bool = True) -> dict:
     return result
 
 
-def get_cached_raw_info(url: str) -> dict | None:
-    """"Сырой" info dict от yt-dlp для этого URL, если он ещё в кеше (и не
-    протух по INFO_CACHE_TTL) — передаётся в worker для скачивания без
-    повторного извлечения. None если кеша нет — вызывающий код тогда просто
-    не передаёт cached_info, и worker извлечёт всё заново сам (как раньше)."""
-    with _info_cache_lock:
-        cached = _info_cache.get(url)
-        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
-            return cached[3]
-    return None
-
-
-def get_cached_proxy(url: str) -> str | None:
-    """Прокси, через который был извлечён закешированный info dict — при
-    переиспользовании кэша на скачивании ОБЯЗАТЕЛЬНО нужен именно ЭТОТ же
-    прокси: подписанные ссылки на файл у YouTube нередко привязаны к IP,
-    который их запросил, так что скачивание с другого IP может вернуть 403
-    даже с валидными (не протухшими по времени) ссылками."""
-    with _info_cache_lock:
-        cached = _info_cache.get(url)
-        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
-            return cached[4]
-    return None
-
-
 def get_cached_client_index(url: str) -> int:
     """Возвращает индекс клиента который сработал для этого URL, или 0."""
     with _info_cache_lock:
@@ -590,15 +565,15 @@ def download_task(task_id: str, url: str, quality: str):
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
-    # Кэш от /api/info для этого же URL — если он ещё жив, первая попытка
-    # скачивания переиспользует уже извлечённые ссылки на форматы вместо
-    # повторного похода к YouTube (см. ytdlp_worker.py). На retry (после
-    # неудачи первой попытки) кэш больше НЕ передаём — он был извлечён
-    # ДРУГИМ клиентом/прокси и для другого клиента уже не валиден, так что
-    # начиная со второй попытки поведение полностью как раньше.
-    raw_cached_info = get_cached_raw_info(url)
-    cached_proxy = get_cached_proxy(url)
-
+    # ── Переиспользование инфы от /api/info для скачивания ОТКЛЮЧЕНО ──────
+    # Была попытка не ходить к YouTube второй раз, переиспользуя уже
+    # извлечённые ссылки на форматы. На практике оказалось ненадёжно —
+    # подписанные ссылки YouTube на файл, похоже, живут заметно меньше, чем
+    # рассчитывалось, и к началу скачивания успевают протухнуть чаще, чем
+    # хотелось бы. Каждая попытка теперь снова делает полное извлечение +
+    # скачивание, как было изначально — надёжность важнее экономии одного
+    # запроса.
+    #
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
     max_attempts = len(CLIENT_ATTEMPTS) * 2
@@ -610,19 +585,11 @@ def download_task(task_id: str, url: str, quality: str):
         client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
         clients, use_cookies = CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]
         cookies_path = setup_cookies() if use_cookies else None
-
-        use_cache_this_attempt = attempt == 0 and raw_cached_info is not None
-        if use_cache_this_attempt:
-            # ВАЖНО: обязательно тот же прокси, что извлекал info — подписанные
-            # ссылки на файл у YouTube нередко привязаны к IP запросившего.
-            # Другой IP на скачивании = 403 даже с "живыми" по времени ссылками.
-            proxy_used = cached_proxy
-        else:
-            proxy_used = select_proxy()
+        proxy_used = select_proxy()
 
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
               f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} "
-              f"height={height} audio={is_audio_only} reuse_cached_info={use_cache_this_attempt}")
+              f"height={height} audio={is_audio_only}")
 
         cfg = {
             "mode": "download",
@@ -635,7 +602,6 @@ def download_task(task_id: str, url: str, quality: str):
             "height": height,
             "is_audio_only": is_audio_only,
             "output_template": out,
-            "cached_info": raw_cached_info if use_cache_this_attempt else None,
         }
 
         proc = _run_worker_streaming(cfg)
