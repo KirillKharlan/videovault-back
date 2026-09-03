@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir flask==3.1.0 flask-cors==5.0.0 gunicorn==23.0.0 \
     brotli pycryptodomex mutagen requests urllib3 websockets certifi
 
 COPY app.py .
+COPY ytdlp_worker.py .
 COPY start.sh .
 RUN chmod +x start.sh
 

@@ -5,7 +5,7 @@ Fixes:
   2. "Задача не найдена" → задачи хранятся в файле на диске (переживают sleep)
 """
 
-import os, json, threading, subprocess, time, uuid, tempfile, re, base64
+import os, sys, json, threading, subprocess, time, uuid, tempfile, re, base64
 
 # ── Режим подробной диагностики ─────────────────────────────────────────────
 # Включается переменной окружения DEBUG_VERBOSE=1 на Render (Environment →
@@ -33,6 +33,11 @@ BASE_DIR = Path(__file__).resolve().parent
 TMP_DIR = Path(tempfile.gettempdir()) / "videovault"
 TMP_DIR.mkdir(exist_ok=True)
 
+# yt_dlp как библиотека (не CLI-бинарь) — запускается ВСЕГДА как отдельный
+# подпроцесс через sys.executable (см. комментарий в самом ytdlp_worker.py
+# про то, зачем нужна изоляция подпроцессом).
+WORKER_SCRIPT = BASE_DIR / "ytdlp_worker.py"
+
 # Файл для хранения задач — переживает sleep сервера
 TASKS_FILE = BASE_DIR / "tasks.json"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
@@ -41,7 +46,13 @@ _tasks_lock = threading.Lock()
 # Кеш результатов /api/info — чтобы /api/download не делал повторный
 # запрос к YouTube для того же URL (это удваивало риск сбоя и выглядело
 # для YouTube как подозрительная повторная активность).
-_info_cache: dict[str, tuple[float, dict, int]] = {}  # url -> (ts, info, working_client_index)
+#
+# Помимо сводки для ответа /api/info, кешируем ещё и "сырой" (sanitized)
+# info dict от yt-dlp целиком — именно он позволяет /api/download не ходить
+# к YouTube заново: worker переиспользует уже извлечённые ссылки на форматы
+# через ydl.process_ie_result() вместо повторного ydl.extract_info().
+# url -> (ts, summary_dict, working_client_index, raw_info_dict, proxy_used)
+_info_cache: dict[str, tuple[float, dict, int, dict, str | None]] = {}
 _info_cache_lock = threading.Lock()
 INFO_CACHE_TTL = 600  # 10 минут
 
@@ -362,45 +373,6 @@ def select_proxy() -> str | None:
     return PROXY_POOL[start % n]
 
 
-def ytdlp_base_args(attempt_index: int = 0) -> tuple[list[str], str | None]:
-    clients, use_cookies = CLIENT_ATTEMPTS[attempt_index % len(CLIENT_ATTEMPTS)]
-    args = [
-        "yt-dlp",
-        "--no-playlist",
-        "--extractor-args", f"youtube:player_client={clients}",
-    ]
-    # ── --no-warnings убран сознательно ──────────────────────────────────
-    # Раньше он скрывал важные предупреждения от yt-dlp (например "The
-    # provided YouTube account cookies are no longer valid") даже в обычном
-    # (не verbose) режиме — из-за этого причину сбоя было видно только с
-    # DEBUG_VERBOSE=1. Теперь такие WARNING всегда попадают в stderr и
-    # classify_error() их распознаёт (см. паттерн "cookies_expired" ниже).
-    if DEBUG_VERBOSE:
-        # --verbose печатает полный трейс: player response, nsig/PO token,
-        # выбор клиента, HTTP-запросы — то, что скрыто в обычном режиме.
-        args += ["--verbose"]
-    if use_cookies:
-        cookies_path = setup_cookies()
-        if cookies_path:
-            args += ["--cookies", cookies_path]
-
-    # ── Прокси ────────────────────────────────────────────────────────────
-    # Эмпирически подтверждено: IP сервера Render заблокирован YouTube на
-    # сетевом уровне. Прокси с обычным (не датацентровым) IP решает проблему.
-    #
-    # Ротация прокси НЕЗАВИСИМА от индекса клиента (attempt_index): она
-    # использует сквозной глобальный счётчик (см. select_proxy), чтобы за
-    # разные запросы реально перебирался весь пул, а не только первые
-    # len(CLIENT_ATTEMPTS) прокси из него. Также пропускает аккаунты с
-    # исчерпанным лимитом. Возвращаем и сам URL — вызывающий код должен
-    # передать его в mark_proxy_account_dead(), если попытка упадёт с 402.
-    proxy_url = select_proxy()
-    if proxy_url:
-        args += ["--proxy", proxy_url]
-
-    return args, proxy_url
-
-
 # ── Получение информации о видео ──────────────────────────────────────────────
 
 def get_video_info(url: str, use_cache: bool = True) -> dict:
@@ -414,15 +386,40 @@ def get_video_info(url: str, use_cache: bool = True) -> dict:
                 result["_client_index"] = cached[2]
                 return result
 
-    result, working_client = _fetch_video_info_uncached(url)
+    result, working_client, raw_info, proxy_used = _fetch_video_info_uncached(url)
 
     if "error" not in result:
         with _info_cache_lock:
-            _info_cache[url] = (time.time(), result, working_client)
+            _info_cache[url] = (time.time(), result, working_client, raw_info, proxy_used)
         result = dict(result)
         result["_client_index"] = working_client
 
     return result
+
+
+def get_cached_raw_info(url: str) -> dict | None:
+    """"Сырой" info dict от yt-dlp для этого URL, если он ещё в кеше (и не
+    протух по INFO_CACHE_TTL) — передаётся в worker для скачивания без
+    повторного извлечения. None если кеша нет — вызывающий код тогда просто
+    не передаёт cached_info, и worker извлечёт всё заново сам (как раньше)."""
+    with _info_cache_lock:
+        cached = _info_cache.get(url)
+        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
+            return cached[3]
+    return None
+
+
+def get_cached_proxy(url: str) -> str | None:
+    """Прокси, через который был извлечён закешированный info dict — при
+    переиспользовании кэша на скачивании ОБЯЗАТЕЛЬНО нужен именно ЭТОТ же
+    прокси: подписанные ссылки на файл у YouTube нередко привязаны к IP,
+    который их запросил, так что скачивание с другого IP может вернуть 403
+    даже с валидными (не протухшими по времени) ссылками."""
+    with _info_cache_lock:
+        cached = _info_cache.get(url)
+        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
+            return cached[4]
+    return None
 
 
 def get_cached_client_index(url: str) -> int:
@@ -432,21 +429,44 @@ def get_cached_client_index(url: str) -> int:
         return cached[2] if cached else 0
 
 
-def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int | None = None) -> tuple[dict, int]:
+def _run_worker(cfg: dict, timeout: int | None = None) -> subprocess.Popen:
+    """Запускает ytdlp_worker.py как подпроцесс с конфигом в stdin (JSON).
+    Возвращает Popen с уже закрытым stdin (конфиг отправлен) — вызывающий
+    код сам решает, читать ли построчно (скачивание) или дождаться конца
+    (получение инфы)."""
+    proc = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    proc.stdin.write(json.dumps(cfg, ensure_ascii=False))
+    proc.stdin.close()
+    return proc
+
+
+def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int | None = None) -> tuple[dict, int, dict | None, str | None]:
     if attempts_left is None:
         attempts_left = len(CLIENT_ATTEMPTS)
+    clients, use_cookies = CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]
+    proxy_used = select_proxy()
+    cookies_path = setup_cookies() if use_cookies else None
+    cfg = {
+        "mode": "info",
+        "url": url,
+        "client": clients,
+        "use_cookies": use_cookies,
+        "cookies_path": cookies_path,
+        "proxy": proxy_used,
+        "verbose": DEBUG_VERBOSE,
+    }
     try:
-        base_args, proxy_used = ytdlp_base_args(client_index)
-        cmd = base_args + [
-            "--dump-json",
-            "--ignore-no-formats-error",
-            url
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        proc = _run_worker(cfg)
+        stdout_data, stderr_data = proc.communicate(timeout=45)
 
-        if r.returncode == 0 and r.stdout.strip():
-            info = json.loads(r.stdout.strip().split("\n")[0])
-            raw_formats = info.get("formats", [])
+        if proc.returncode == 0 and stdout_data.strip():
+            event = json.loads(stdout_data.strip().split("\n")[0])
+            info = event.get("info", {})
+            raw_formats = info.get("formats") or []
             qualities = set()
             for f in raw_formats:
                 h = f.get("height")
@@ -458,7 +478,7 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
 
             # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
             print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
-                  f"proxy={proxy_used[:30]}... "
+                  f"proxy={(proxy_used or 'none')[:30]}... "
                   f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
 
             is_poor_data = not sorted_q and duration == 0
@@ -486,20 +506,21 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
 
             print(f"[DEBUG] Info OK with attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
                   f"qualities={sorted_q} duration={duration}")
-            return {
+            summary = {
                 "title":     info.get("title", "Видео"),
                 "thumbnail": info.get("thumbnail", ""),
                 "duration":  duration,
                 "uploader":  info.get("uploader", ""),
                 "platform":  info.get("extractor_key", "").lower(),
                 "qualities": [str(q) for q in sorted_q] or ["best"],
-            }, client_index
+            }
+            return summary, client_index, info, proxy_used
 
-        print(f"[DEBUG] yt-dlp FAILED attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}")
-        print(f"[DEBUG] stderr: {r.stderr[-_LOG_TAIL_CHARS:]}")
-        print(f"[DEBUG] stdout: {r.stdout[-_LOG_TAIL_CHARS:]}")
+        print(f"[DEBUG] yt-dlp worker FAILED attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}")
+        print(f"[DEBUG] stderr: {stderr_data[-_LOG_TAIL_CHARS:]}")
+        print(f"[DEBUG] stdout: {stdout_data[-_LOG_TAIL_CHARS:]}")
 
-        err_type, message = classify_error(r.stderr + r.stdout)
+        err_type, message = classify_error(stderr_data + stdout_data)
         if err_type == "proxy_quota" and proxy_used:
             mark_proxy_account_dead(proxy_used)
 
@@ -508,15 +529,16 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
             time.sleep(1.5)
             return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
 
-        return {"error": message, "error_type": err_type}, client_index
+        return {"error": message, "error_type": err_type}, client_index, None, proxy_used
 
     except subprocess.TimeoutExpired:
+        proc.kill()
         if attempts_left > 1:
             time.sleep(1.5)
             return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
-        return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}, client_index
+        return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}, client_index, None, proxy_used
     except Exception as e:
-        return {"error": str(e), "error_type": "unknown"}, client_index
+        return {"error": str(e), "error_type": "unknown"}, client_index, None, None
 
 
 # ── Задача скачивания ─────────────────────────────────────────────────────────
@@ -542,84 +564,82 @@ def download_task(task_id: str, url: str, quality: str):
     clean_q = re.sub(r"\D", "", quality)
     is_audio_only = quality.strip().lower() in ("mp3", "audio", "audio_only")
 
-    def build_format_args(h: int | None) -> list[str]:
-        if h:
-            return [
-                "--format-sort", f"res:{h},ext:mp4:m4a,+codec:avc:m4a",
-                "-f", f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best",
-            ]
-        return [
-            "--format-sort", "res,ext:mp4:m4a,+codec:avc:m4a",
-            "-f", "bestvideo+bestaudio/best",
-        ]
-
-    def build_audio_args() -> list[str]:
-        return [
-            "-f", "bestaudio/best",
-            "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        ]
-
     height = int(clean_q) if clean_q and clean_q.isdigit() else None
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
+    # Кэш от /api/info для этого же URL — если он ещё жив, первая попытка
+    # скачивания переиспользует уже извлечённые ссылки на форматы вместо
+    # повторного похода к YouTube (см. ytdlp_worker.py). На retry (после
+    # неудачи первой попытки) кэш больше НЕ передаём — он был извлечён
+    # ДРУГИМ клиентом/прокси и для другого клиента уже не валиден, так что
+    # начиная со второй попытки поведение полностью как раньше.
+    raw_cached_info = get_cached_raw_info(url)
+    cached_proxy = get_cached_proxy(url)
+
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
-    max_attempts = len(CLIENT_ATTEMPTS) * 9
+    max_attempts = len(CLIENT_ATTEMPTS) * 2
     last_stderr = ""
     last_stdout_lines: list[str] = []
     was_killed_by_signal = False
 
     for attempt in range(max_attempts):
         client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
-        extra_args = build_audio_args() if is_audio_only else build_format_args(height)
+        clients, use_cookies = CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]
+        cookies_path = setup_cookies() if use_cookies else None
+
+        use_cache_this_attempt = attempt == 0 and raw_cached_info is not None
+        if use_cache_this_attempt:
+            # ВАЖНО: обязательно тот же прокси, что извлекал info — подписанные
+            # ссылки на файл у YouTube нередко привязаны к IP запросившего.
+            # Другой IP на скачивании = 403 даже с "живыми" по времени ссылками.
+            proxy_used = cached_proxy
+        else:
+            proxy_used = select_proxy()
 
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
-              f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} extra_args={extra_args}")
+              f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} "
+              f"height={height} audio={is_audio_only} reuse_cached_info={use_cache_this_attempt}")
 
-        base_args, proxy_used = ytdlp_base_args(client_index)
-        base_cmd = base_args + extra_args + [
-            "--newline",
-            "--ignore-no-formats-error",
-            # Ограничиваем потоки ffmpeg на слиянии/конвертации — на free-тарифе
-            # Render (512MB RAM, общий CPU) это немного снижает пиковую нагрузку.
-            "--postprocessor-args", "ffmpeg:-threads 1",
-        ]
-        if not is_audio_only:
-            # --merge-output-format имеет смысл только когда реально сливаем
-            # видео+аудио дорожки; для -x (извлечение аудио) он не нужен —
-            # yt-dlp сам определяет итоговое расширение (.mp3).
-            base_cmd += ["--merge-output-format", "mp4"]
-        cmd = base_cmd + ["-o", out, url]
+        cfg = {
+            "mode": "download",
+            "url": url,
+            "client": clients,
+            "use_cookies": use_cookies,
+            "cookies_path": cookies_path,
+            "proxy": proxy_used,
+            "verbose": DEBUG_VERBOSE,
+            "height": height,
+            "is_audio_only": is_audio_only,
+            "output_template": out,
+            "cached_info": raw_cached_info if use_cache_this_attempt else None,
+        }
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout_lines = []
+        proc = _run_worker(cfg)
+        stdout_lines: list[str] = []
 
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
             stdout_lines.append(line)
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue  # на всякий случай игнорируем нераспознанные строки
 
-            if "[download]" in line and "%" in line:
-                m_pct   = re.search(r"(\d+\.?\d*)%", line)
-                m_speed = re.search(r"at\s+([\d.]+\s*\w+/s)", line)
-                m_eta   = re.search(r"ETA\s+([\d:]+)", line)
-                m_size  = re.search(r"of\s+([\d.]+\s*\w+)", line)
-
-                if m_pct:
-                    update_task(task_id, percent=min(95, float(m_pct.group(1))),
-                                status="downloading")
+            if event.get("type") == "progress":
+                pct = event.get("percent")
+                if pct is not None:
+                    update_task(task_id, percent=min(95, pct), status="downloading")
                 parts = []
-                if m_size:  parts.append(f"Размер: {m_size.group(1)}")
-                if m_speed: parts.append(f"Скорость: {m_speed.group(1)}")
-                if m_eta:   parts.append(f"Осталось: {m_eta.group(1)}")
-                if parts:   update_task(task_id, step=" · ".join(parts))
-
-            elif "[Merger]" in line or "Merging" in line:
-                update_task(task_id, step="🔀 Объединение аудио и видео…", percent=97)
-            elif "Destination:" in line:
-                update_task(task_id, step="💾 Сохранение…")
+                if event.get("total"): parts.append(f"Размер: {event['total']}")
+                if event.get("speed"): parts.append(f"Скорость: {event['speed']}")
+                if event.get("eta"):   parts.append(f"Осталось: {event['eta']}")
+                if parts: update_task(task_id, step=" · ".join(parts))
+            elif event.get("type") == "step":
+                update_task(task_id, step=event.get("text", ""))
 
         stderr_out = proc.stderr.read()
         proc.wait()
