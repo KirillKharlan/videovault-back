@@ -429,11 +429,35 @@ def get_cached_client_index(url: str) -> int:
         return cached[2] if cached else 0
 
 
-def _run_worker(cfg: dict, timeout: int | None = None) -> subprocess.Popen:
-    """Запускает ytdlp_worker.py как подпроцесс с конфигом в stdin (JSON).
-    Возвращает Popen с уже закрытым stdin (конфиг отправлен) — вызывающий
-    код сам решает, читать ли построчно (скачивание) или дождаться конца
-    (получение инфы)."""
+def _run_worker_once(cfg: dict, timeout: int) -> tuple[int, str, str]:
+    """Разовый вызов ytdlp_worker.py — для случаев, когда нужно записать
+    конфиг, дождаться завершения и прочитать весь вывод целиком (без
+    построчного чтения по ходу выполнения). Всё это делает сам
+    communicate(input=...) за один безопасный проход — не трогаем pipe'ы
+    вручную, чтобы не словить 'I/O operation on closed file' (двойное
+    ручное закрытие stdin конфликтовало с внутренней логикой communicate())."""
+    proc = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout_data, stderr_data = proc.communicate(
+            input=json.dumps(cfg, ensure_ascii=False), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()  # добираем пайпы после kill, чтобы не оставить зомби-процесс
+        raise
+    return proc.returncode, stdout_data, stderr_data
+
+
+def _run_worker_streaming(cfg: dict) -> subprocess.Popen:
+    """Потоковый вызов ytdlp_worker.py — для скачивания, где нужно читать
+    stdout построчно ПО ХОДУ выполнения (прогресс), поэтому communicate()
+    здесь не подходит (он ждёт завершения процесса целиком). Конфиг пишем и
+    сразу закрываем stdin вручную — это единственное место, где стдин вообще
+    трогается для этого proc, так что второго закрытия конфликтовать не с
+    чем."""
     proc = subprocess.Popen(
         [sys.executable, str(WORKER_SCRIPT)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -460,10 +484,9 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
         "verbose": DEBUG_VERBOSE,
     }
     try:
-        proc = _run_worker(cfg)
-        stdout_data, stderr_data = proc.communicate(timeout=45)
+        proc_returncode, stdout_data, stderr_data = _run_worker_once(cfg, timeout=45)
 
-        if proc.returncode == 0 and stdout_data.strip():
+        if proc_returncode == 0 and stdout_data.strip():
             event = json.loads(stdout_data.strip().split("\n")[0])
             info = event.get("info", {})
             raw_formats = info.get("formats") or []
@@ -532,7 +555,6 @@ def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: i
         return {"error": message, "error_type": err_type}, client_index, None, proxy_used
 
     except subprocess.TimeoutExpired:
-        proc.kill()
         if attempts_left > 1:
             time.sleep(1.5)
             return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
@@ -616,7 +638,7 @@ def download_task(task_id: str, url: str, quality: str):
             "cached_info": raw_cached_info if use_cache_this_attempt else None,
         }
 
-        proc = _run_worker(cfg)
+        proc = _run_worker_streaming(cfg)
         stdout_lines: list[str] = []
 
         for line in proc.stdout:
