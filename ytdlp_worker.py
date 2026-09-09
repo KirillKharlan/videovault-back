@@ -20,14 +20,12 @@ stderr CLI-вызова, так что вся классификация оши�
 Режимы (config["mode"]):
   "info"     — извлекает метаданные БЕЗ скачивания. Пишет одну строку
                {"type": "info", "info": {...}} с "сырым" (sanitized) info
-               dict — его можно закешировать и передать сюда же в режиме
-               "download" как cached_info, чтобы не ходить к YouTube второй
-               раз за тем же видео.
-  "download" — качает видео/аудио. Если передан cached_info и он ещё не
-               протух (не истекли подписанные ссылки на файл) — скачивание
-               идёт БЕЗ повторного извлечения. Если cached_info не сработал
-               (например, ссылки протухли) — автоматически откатывается на
-               обычное извлечение+скачивание за один проход, как раньше.
+               dict.
+  "download" — качает видео/аудио: полное извлечение + скачивание за один
+               проход (попытка переиспользовать уже извлечённую с /api/info
+               информацию оказалась ненадёжной на практике — подписанные
+               ссылки YouTube на файл протухают быстрее, чем рассчитывалось
+               — поэтому от неё отказались в пользу надёжности).
 """
 import sys
 import json
@@ -124,6 +122,11 @@ def _download_opts(cfg: dict) -> dict:
     opts["postprocessor_args"] = {"ffmpeg": ["-threads", "1"]}
     opts["progress_hooks"] = [_make_progress_hook()]
     opts["postprocessor_hooks"] = [_make_postprocessor_hook()]
+    # Параллельная закачка кусков (фрагментов) видео вместо последовательной
+    # — заметно быстрее на длинных/тяжёлых видео. 4 — умеренное значение:
+    # больше не берём сознательно, чтобы не поднимать пиковую память на
+    # free-тарифе Render (512MB RAM) сильнее, чем нужно.
+    opts["concurrent_fragment_downloads"] = 4
 
     if cfg.get("is_audio_only"):
         opts["format"] = "bestaudio/best"
@@ -146,22 +149,7 @@ def _download_opts(cfg: dict) -> dict:
 
 def run_download(cfg: dict) -> None:
     opts = _download_opts(cfg)
-    cached_info = cfg.get("cached_info")
-
     with yt_dlp.YoutubeDL(opts) as ydl:
-        if cached_info is not None:
-            try:
-                # Основной путь: переиспользуем уже извлечённые форматы —
-                # ни одного нового обращения к YouTube на этот запрос.
-                ydl.process_ie_result(dict(cached_info), download=True)
-                return
-            except Exception as e:
-                # Кэш мог протухнуть (подписанные ссылки на файл живут
-                # ограниченное время) — тихо откатываемся на обычное
-                # извлечение+скачивание за один проход, как было раньше.
-                print(f"[worker] cached_info не сработал ({e}), "
-                      f"полное извлечение заново", file=sys.stderr)
-
         ydl.extract_info(cfg["url"], download=True)
 
 
