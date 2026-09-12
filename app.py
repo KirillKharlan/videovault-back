@@ -5,7 +5,7 @@ Fixes:
   2. "Задача не найдена" → задачи хранятся в файле на диске (переживают sleep)
 """
 
-import os, sys, json, threading, subprocess, time, uuid, tempfile, re, base64
+import os, sys, json, threading, subprocess, time, uuid, tempfile, re, base64, queue
 
 # ── Режим подробной диагностики ─────────────────────────────────────────────
 # Включается переменной окружения DEBUG_VERBOSE=1 на Render (Environment →
@@ -55,6 +55,11 @@ _tasks_lock = threading.Lock()
 _info_cache: dict[str, tuple[float, dict, int, dict, str | None]] = {}
 _info_cache_lock = threading.Lock()
 INFO_CACHE_TTL = 600  # 10 минут
+
+# Если от попытки скачивания не пришло ни строчки прогресса дольше этого —
+# считаем её зависшей (плохой прокси/сеть) и переходим к следующей попытке,
+# вместо того чтобы ждать бесконечно (раньше тут тайм-аута не было вообще).
+STALL_TIMEOUT = 90  # секунд
 
 
 # ── Хранение задач на диске ───────────────────────────────────────────────────
@@ -576,7 +581,7 @@ def download_task(task_id: str, url: str, quality: str):
     #
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
-    max_attempts = len(CLIENT_ATTEMPTS) * 9 * 9
+    max_attempts = len(CLIENT_ATTEMPTS) * 2
     last_stderr = ""
     last_stdout_lines: list[str] = []
     was_killed_by_signal = False
@@ -607,7 +612,36 @@ def download_task(task_id: str, url: str, quality: str):
         proc = _run_worker_streaming(cfg)
         stdout_lines: list[str] = []
 
-        for line in proc.stdout:
+        # ── Детект "зависшей" попытки ──────────────────────────────────────
+        # Раньше здесь было простое blocking-чтение (for line in proc.stdout),
+        # без вообще какого-либо тайм-аута — если сеть/прокси застревали,
+        # попытка могла висеть бесконечно, а не переходить к следующей.
+        # Читаем строки в отдельном потоке через очередь: если новых строк
+        # нет дольше STALL_TIMEOUT секунд подряд — считаем попытку зависшей,
+        # убиваем процесс и идём к следующей попытке/клиенту.
+        line_queue: "queue.Queue[str | None]" = queue.Queue()
+
+        def _reader():
+            try:
+                for ln in proc.stdout:
+                    line_queue.put(ln)
+            finally:
+                line_queue.put(None)  # сигнал конца потока
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        stalled = False
+        while True:
+            try:
+                line = line_queue.get(timeout=STALL_TIMEOUT)
+            except queue.Empty:
+                stalled = True
+                print(f"[DEBUG] Attempt {attempt+1} stalled — no progress for "
+                      f"{STALL_TIMEOUT}s, killing and moving to next attempt")
+                proc.kill()
+                break
+            if line is None:
+                break  # процесс завершился сам — нормальный путь
             line = line.strip()
             if not line:
                 continue
@@ -632,7 +666,11 @@ def download_task(task_id: str, url: str, quality: str):
         stderr_out = proc.stderr.read()
         proc.wait()
 
-        if proc.returncode == 0:
+        if stalled:
+            last_stderr = (f"⏱ Загрузка зависла (нет прогресса {STALL_TIMEOUT}s) — "
+                            f"вероятно, проблема с прокси/сетью")
+            last_stdout_lines = stdout_lines
+        elif proc.returncode == 0:
             files = list(TMP_DIR.glob(f"{task_id}_*"))
             if files:
                 vp = max(files, key=lambda f: f.stat().st_size)
