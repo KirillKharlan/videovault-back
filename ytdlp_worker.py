@@ -129,7 +129,12 @@ def _download_opts(cfg: dict) -> dict:
     opts["concurrent_fragment_downloads"] = 4
 
     if cfg.get("is_audio_only"):
-        opts["format"] = "bestaudio/best"
+        # "exact_format" — селектор, уже посчитанный на стороне app.py с
+        # учётом закешированных format_id из /api/info (см.
+        # _resolve_format_selector в app.py). Содержит generic-селектор как
+        # fallback внутри себя через "/", так что можно просто использовать
+        # его напрямую, если он передан.
+        opts["format"] = cfg.get("exact_format") or "bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -137,11 +142,15 @@ def _download_opts(cfg: dict) -> dict:
         }]
     else:
         h = cfg.get("height")
-        if h:
+        if cfg.get("exact_format"):
+            opts["format"] = cfg["exact_format"]
+        elif h:
             opts["format"] = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-            opts["format_sort"] = [f"res:{h}", "ext:mp4:m4a", "+codec:avc:m4a"]
         else:
             opts["format"] = "bestvideo+bestaudio/best"
+        if h:
+            opts["format_sort"] = [f"res:{h}", "ext:mp4:m4a", "+codec:avc:m4a"]
+        else:
             opts["format_sort"] = ["res", "ext:mp4:m4a", "+codec:avc:m4a"]
         opts["merge_output_format"] = "mp4"
     return opts

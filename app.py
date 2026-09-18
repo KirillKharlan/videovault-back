@@ -6,6 +6,7 @@ Fixes:
 """
 
 import os, sys, json, threading, subprocess, time, uuid, tempfile, re, base64, queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Режим подробной диагностики ─────────────────────────────────────────────
 # Включается переменной окружения DEBUG_VERBOSE=1 на Render (Environment →
@@ -43,18 +44,35 @@ TASKS_FILE = BASE_DIR / "tasks.json"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
 _tasks_lock = threading.Lock()
 
-# Кеш результатов /api/info — чтобы /api/download не делал повторный
-# запрос к YouTube для того же URL (это удваивало риск сбоя и выглядело
-# для YouTube как подозрительная повторная активность).
-#
-# Помимо сводки для ответа /api/info, кешируем ещё и "сырой" (sanitized)
-# info dict от yt-dlp целиком — именно он позволяет /api/download не ходить
-# к YouTube заново: worker переиспользует уже извлечённые ссылки на форматы
-# через ydl.process_ie_result() вместо повторного ydl.extract_info().
+# Кеш результатов /api/info — чтобы /api/download мог сразу знать, какой
+# клиент недавно сработал для этого же URL, и какие форматы/качества
+# доступны (используется при выборе точного format_id на скачивании —
+# см. _resolve_format_ids). Сам файл видео всё равно извлекается заново на
+# каждой попытке скачивания (переиспользование готовых ссылок на файл
+# оказалось ненадёжным — см. историю в ytdlp_worker.py).
 # url -> (ts, summary_dict, working_client_index, raw_info_dict, proxy_used)
 _info_cache: dict[str, tuple[float, dict, int, dict, str | None]] = {}
 _info_cache_lock = threading.Lock()
 INFO_CACHE_TTL = 600  # 10 минут
+
+# ── Глобальный "последний рабочий клиент" ───────────────────────────────────
+# Раньше каждый новый запрос (для НОВОГО, ещё не кешированного URL) всегда
+# начинал перебор с CLIENT_ATTEMPTS[0], даже если для 50 предыдущих видео
+# подряд отвечал только, скажем, клиент №2. Теперь запоминаем глобально,
+# какой клиент сработал последним (по любому URL), и новые запросы стартуют
+# именно с него — по сути self-tuning под то, что сейчас реально пропускает
+# YouTube/прокси, без ручной перестановки CLIENT_ATTEMPTS.
+_global_client_lock = threading.Lock()
+_global_best_client_index = 0
+
+def _record_client_success(idx: int) -> None:
+    global _global_best_client_index
+    with _global_client_lock:
+        _global_best_client_index = idx % len(CLIENT_ATTEMPTS)
+
+def _get_global_best_client_index() -> int:
+    with _global_client_lock:
+        return _global_best_client_index
 
 # Если от попытки скачивания не пришло ни строчки прогресса дольше этого —
 # считаем её зависшей (плохой прокси/сеть) и переходим к следующей попытке,
@@ -380,6 +398,79 @@ def select_proxy() -> str | None:
 
 # ── Получение информации о видео ──────────────────────────────────────────────
 
+# ── Точный подбор format_id из закешированной инфы ──────────────────────────
+# В отличие от прошлой (откаченной) идеи "переиспользовать готовые ссылки на
+# файл", здесь переиспользуется только СПИСОК форматов (какие itag'и вообще
+# существуют для этого видео) — не сами ссылки. На скачивании всё равно
+# происходит полное свежее извлечение, просто yt-dlp сразу знает точный
+# format_id вместо того чтобы каждый раз заново перебирать/угадывать его по
+# generic-селектору вида "bestvideo[height<=X]". Generic-селектор всё равно
+# остаётся как fallback внутри итогового селектора (через "/") — если
+# конкретный id вдруг не найдётся на свежем извлечении (например, YouTube
+# изменил набор дорожек), скачивание не упадёт, просто отработает как раньше.
+def _best_video_format_id(formats: list[dict], height: int | None) -> str | None:
+    candidates = [f for f in formats
+                  if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none"
+                  and f.get("format_id")]
+    if not candidates:
+        return None
+    if height:
+        within = [f for f in candidates if (f.get("height") or 0) <= height]
+        if within:
+            candidates = within
+    def score(f):
+        is_mp4_avc = 1 if (f.get("ext") == "mp4" or "avc" in (f.get("vcodec") or "")) else 0
+        return (is_mp4_avc, f.get("height") or 0, f.get("tbr") or 0)
+    return str(max(candidates, key=score)["format_id"])
+
+
+def _best_audio_format_id(formats: list[dict]) -> str | None:
+    candidates = [f for f in formats
+                  if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
+                  and f.get("format_id")]
+    if not candidates:
+        return None
+    def score(f):
+        is_m4a = 1 if f.get("ext") == "m4a" else 0
+        return (is_m4a, f.get("abr") or 0)
+    return str(max(candidates, key=score)["format_id"])
+
+
+def _resolve_format_selector(raw_info: dict | None, height: int | None, is_audio_only: bool) -> str:
+    """Возвращает format-селектор для yt-dlp: точный format_id из
+    закешированной инфы + generic-селектор как fallback. Если кэша/форматов
+    нет — просто generic-селектор, ничего не меняется относительно старого
+    поведения."""
+    generic = ("bestaudio/best" if is_audio_only else (
+        f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best" if height
+        else "bestvideo+bestaudio/best"
+    ))
+    formats = (raw_info or {}).get("formats") or []
+    if not formats:
+        return generic
+
+    if is_audio_only:
+        audio_id = _best_audio_format_id(formats)
+        return f"{audio_id}/{generic}" if audio_id else generic
+
+    video_id = _best_video_format_id(formats, height)
+    audio_id = _best_audio_format_id(formats)
+    if video_id and audio_id:
+        return f"{video_id}+{audio_id}/{generic}"
+    return generic
+
+
+def get_cached_raw_info(url: str) -> dict | None:
+    """"Сырой" info dict (со списком форматов) для этого URL, если он ещё в
+    кеше — используется ТОЛЬКО для подбора точного format_id
+    (_resolve_format_selector), не для переиспользования ссылок на файл."""
+    with _info_cache_lock:
+        cached = _info_cache.get(url)
+        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
+            return cached[3]
+    return None
+
+
 def get_video_info(url: str, use_cache: bool = True) -> dict:
     # ── Проверяем кеш ────────────────────────────────────────────────────
     if use_cache:
@@ -403,10 +494,13 @@ def get_video_info(url: str, use_cache: bool = True) -> dict:
 
 
 def get_cached_client_index(url: str) -> int:
-    """Возвращает индекс клиента который сработал для этого URL, или 0."""
+    """Индекс клиента, который сработал для ЭТОГО URL, если он ещё в кеше;
+    иначе — глобально последний рабочий клиент (не всегда 0)."""
     with _info_cache_lock:
         cached = _info_cache.get(url)
-        return cached[2] if cached else 0
+        if cached:
+            return cached[2]
+    return _get_global_best_client_index()
 
 
 def _run_worker_once(cfg: dict, timeout: int) -> tuple[int, str, str]:
@@ -448,99 +542,133 @@ def _run_worker_streaming(cfg: dict) -> subprocess.Popen:
     return proc
 
 
-def _fetch_video_info_uncached(url: str, client_index: int = 0, attempts_left: int | None = None) -> tuple[dict, int, dict | None, str | None]:
-    if attempts_left is None:
-        attempts_left = len(CLIENT_ATTEMPTS)
+def _try_one_client_for_info(url: str, client_index: int) -> dict:
+    """Одна попытка получить инфо через ОДИН конкретный клиент — вынесена в
+    отдельную функцию, чтобы запускать несколько таких попыток ОДНОВРЕМЕННО
+    (см. _fetch_video_info_uncached) вместо строго последовательного
+    перебора. Возвращает dict с "ok": True/False и подробностями."""
     clients, use_cookies = CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]
     proxy_used = select_proxy()
     cookies_path = setup_cookies() if use_cookies else None
     cfg = {
-        "mode": "info",
-        "url": url,
-        "client": clients,
-        "use_cookies": use_cookies,
-        "cookies_path": cookies_path,
-        "proxy": proxy_used,
-        "verbose": DEBUG_VERBOSE,
+        "mode": "info", "url": url, "client": clients,
+        "use_cookies": use_cookies, "cookies_path": cookies_path,
+        "proxy": proxy_used, "verbose": DEBUG_VERBOSE,
     }
+    label = f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}"
+
     try:
         proc_returncode, stdout_data, stderr_data = _run_worker_once(cfg, timeout=45)
-
-        if proc_returncode == 0 and stdout_data.strip():
-            event = json.loads(stdout_data.strip().split("\n")[0])
-            info = event.get("info", {})
-            raw_formats = info.get("formats") or []
-            qualities = set()
-            for f in raw_formats:
-                h = f.get("height")
-                vcodec = f.get("vcodec", "none")
-                if h and h >= 240 and vcodec != "none":
-                    qualities.add(h)
-            sorted_q = sorted(qualities, reverse=True)
-            duration = int(info.get("duration") or 0)
-
-            # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
-            print(f"[DEBUG] attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
-                  f"proxy={(proxy_used or 'none')[:30]}... "
-                  f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
-
-            is_poor_data = not sorted_q and duration == 0
-            if is_poor_data:
-                # Печатаем ПОЧЕМУ именно нет форматов — вместо гадания.
-                # Эти поля прямо говорят о причине: возрастное ограничение,
-                # региональная блокировка, стрим, премьера, платный контент и т.д.
-                print(f"[DEBUG] Poor-data diagnostics for this video:")
-                print(f"[DEBUG]   age_limit: {info.get('age_limit')}")
-                print(f"[DEBUG]   availability: {info.get('availability')}")
-                print(f"[DEBUG]   is_live: {info.get('is_live')}")
-                print(f"[DEBUG]   live_status: {info.get('live_status')}")
-                print(f"[DEBUG]   requires_premium: {info.get('requires_premium')}")
-                print(f"[DEBUG]   playable_in_embed: {info.get('playable_in_embed')}")
-
-            # Клиент ответил, но реальных данных почти нет (0 форматов, 0 длительность).
-            # Может быть из-за YouTube Shorts С определёнными клиентами, ИЛИ из-за
-            # просроченных/повреждённых cookies (см. CLIENT_ATTEMPTS — там есть
-            # варианты и с cookies, и без). Считаем неудачей и пробуем следующую
-            # комбинацию если попытки ещё остались.
-            if is_poor_data and attempts_left > 1:
-                print(f"[DEBUG] Poor data (no formats, duration=0) — trying next attempt")
-                time.sleep(1.0)
-                return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
-
-            print(f"[DEBUG] Info OK with attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]} "
-                  f"qualities={sorted_q} duration={duration}")
-            summary = {
-                "title":     info.get("title", "Видео"),
-                "thumbnail": info.get("thumbnail", ""),
-                "duration":  duration,
-                "uploader":  info.get("uploader", ""),
-                "platform":  info.get("extractor_key", "").lower(),
-                "qualities": [str(q) for q in sorted_q] or ["best"],
-            }
-            return summary, client_index, info, proxy_used
-
-        print(f"[DEBUG] yt-dlp worker FAILED attempt[{client_index}]={CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]}")
-        print(f"[DEBUG] stderr: {stderr_data[-_LOG_TAIL_CHARS:]}")
-        print(f"[DEBUG] stdout: {stdout_data[-_LOG_TAIL_CHARS:]}")
-
-        err_type, message = classify_error(stderr_data + stdout_data)
-        if err_type == "proxy_quota" and proxy_used:
-            mark_proxy_account_dead(proxy_used)
-
-        if attempts_left > 1:
-            print(f"[DEBUG] Trying next client set, {attempts_left - 1} attempts left...")
-            time.sleep(1.5)
-            return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
-
-        return {"error": message, "error_type": err_type}, client_index, None, proxy_used
-
     except subprocess.TimeoutExpired:
-        if attempts_left > 1:
-            time.sleep(1.5)
-            return _fetch_video_info_uncached(url, client_index + 1, attempts_left - 1)
-        return {"error": "⏱ Таймаут — сайт не ответил", "error_type": "network"}, client_index, None, proxy_used
+        return {"ok": False, "client_index": client_index, "proxy_used": proxy_used,
+                "err_type": "network", "message": "⏱ Таймаут — сайт не ответил"}
     except Exception as e:
-        return {"error": str(e), "error_type": "unknown"}, client_index, None, None
+        return {"ok": False, "client_index": client_index, "proxy_used": None,
+                "err_type": "unknown", "message": str(e)}
+
+    if proc_returncode == 0 and stdout_data.strip():
+        event = json.loads(stdout_data.strip().split("\n")[0])
+        info = event.get("info", {})
+        raw_formats = info.get("formats") or []
+        qualities = set()
+        for f in raw_formats:
+            h = f.get("height")
+            vcodec = f.get("vcodec", "none")
+            if h and h >= 240 and vcodec != "none":
+                qualities.add(h)
+        sorted_q = sorted(qualities, reverse=True)
+        duration = int(info.get("duration") or 0)
+
+        # Диагностика: сколько форматов пришло вообще (даже до фильтрации)
+        print(f"[DEBUG] {label} proxy={(proxy_used or 'none')[:30]}... "
+              f"raw_formats_count={len(raw_formats)} filtered_qualities={sorted_q} duration={duration}")
+
+        is_poor_data = not sorted_q and duration == 0
+        if is_poor_data:
+            # Печатаем ПОЧЕМУ именно нет форматов — вместо гадания. Эти поля
+            # прямо говорят о причине: возрастное ограничение, региональная
+            # блокировка, стрим, премьера, платный контент и т.д.
+            print(f"[DEBUG] Poor-data diagnostics for this video:")
+            print(f"[DEBUG]   age_limit: {info.get('age_limit')}")
+            print(f"[DEBUG]   availability: {info.get('availability')}")
+            print(f"[DEBUG]   is_live: {info.get('is_live')}")
+            print(f"[DEBUG]   live_status: {info.get('live_status')}")
+            print(f"[DEBUG]   requires_premium: {info.get('requires_premium')}")
+            print(f"[DEBUG]   playable_in_embed: {info.get('playable_in_embed')}")
+            return {"ok": False, "client_index": client_index, "proxy_used": proxy_used,
+                    "err_type": "poor_data", "message": "Пустые данные от этого клиента"}
+
+        print(f"[DEBUG] Info OK with {label} qualities={sorted_q} duration={duration}")
+        summary = {
+            "title":     info.get("title", "Видео"),
+            "thumbnail": info.get("thumbnail", ""),
+            "duration":  duration,
+            "uploader":  info.get("uploader", ""),
+            "platform":  info.get("extractor_key", "").lower(),
+            "qualities": [str(q) for q in sorted_q] or ["best"],
+        }
+        return {"ok": True, "client_index": client_index, "proxy_used": proxy_used,
+                "summary": summary, "raw_info": info}
+
+    print(f"[DEBUG] yt-dlp worker FAILED {label}")
+    print(f"[DEBUG] stderr: {stderr_data[-_LOG_TAIL_CHARS:]}")
+    print(f"[DEBUG] stdout: {stdout_data[-_LOG_TAIL_CHARS:]}")
+    err_type, message = classify_error(stderr_data + stdout_data)
+    if err_type == "proxy_quota" and proxy_used:
+        mark_proxy_account_dead(proxy_used)
+    return {"ok": False, "client_index": client_index, "proxy_used": proxy_used,
+            "err_type": err_type, "message": message}
+
+
+# Сколько клиентов пробовать ОДНОВРЕМЕННО за один "залп", вместо строго по
+# одному. Компромисс: больше — быстрее приходит первый успешный ответ, но
+# больше одновременной нагрузки на прокси-пул сразу. 3 — разумная середина
+# при небольшом пуле прокси.
+INFO_PARALLEL_BATCH = 3
+
+
+def _client_order(start_index: int) -> list[int]:
+    """Порядок перебора клиентов, начиная с [start_index] и по кругу через
+    все остальные — так же, как раньше, только не всегда с нуля."""
+    n = len(CLIENT_ATTEMPTS)
+    return [(start_index + i) % n for i in range(n)]
+
+
+def _fetch_video_info_uncached(url: str) -> tuple[dict, int, dict | None, str | None]:
+    """Перебирает клиентов ПАРТИЯМИ по INFO_PARALLEL_BATCH штук одновременно
+    (вместо строго по одному) — берём первый успешный ответ в партии и сразу
+    возвращаем, не дожидаясь остальных. Начинаем не с клиента №0, а с
+    глобально последнего рабочего (см. _get_global_best_client_index)."""
+    order = _client_order(_get_global_best_client_index())
+    last_err_type, last_message = "unknown", "Не удалось получить информацию о видео"
+
+    i = 0
+    while i < len(order):
+        batch = order[i:i + INFO_PARALLEL_BATCH]
+        ex = ThreadPoolExecutor(max_workers=len(batch))
+        futures = [ex.submit(_try_one_client_for_info, url, ci) for ci in batch]
+        try:
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res["ok"]:
+                    _record_client_success(res["client_index"])
+                    return res["summary"], res["client_index"], res["raw_info"], res["proxy_used"]
+                if res["err_type"] in ("private", "age_restricted", "geo_blocked", "not_found", "copyright"):
+                    # Содержательная ошибка про само видео (не про клиента) —
+                    # дальше пробовать смысла нет, ни в этой партии, ни в следующих.
+                    return ({"error": res["message"], "error_type": res["err_type"]},
+                            res["client_index"], None, res["proxy_used"])
+                last_err_type, last_message = res["err_type"], res["message"]
+        finally:
+            # wait=False — не блокируем возврат результата, пока "лишние"
+            # (уже не нужные, раз кто-то в партии сработал) потоки в фоне
+            # доработают сами по себе и результат отбросится.
+            ex.shutdown(wait=False, cancel_futures=True)
+        i += INFO_PARALLEL_BATCH
+        if i < len(order):
+            time.sleep(1.0)
+
+    return {"error": last_message, "error_type": last_err_type}, (order[-1] if order else 0), None, None
 
 
 # ── Задача скачивания ─────────────────────────────────────────────────────────
@@ -570,18 +698,16 @@ def download_task(task_id: str, url: str, quality: str):
     safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
     out = str(TMP_DIR / f"{task_id}_{safe}.%(ext)s")
 
-    # ── Переиспользование инфы от /api/info для скачивания ОТКЛЮЧЕНО ──────
-    # Была попытка не ходить к YouTube второй раз, переиспользуя уже
-    # извлечённые ссылки на форматы. На практике оказалось ненадёжно —
-    # подписанные ссылки YouTube на файл, похоже, живут заметно меньше, чем
-    # рассчитывалось, и к началу скачивания успевают протухнуть чаще, чем
-    # хотелось бы. Каждая попытка теперь снова делает полное извлечение +
-    # скачивание, как было изначально — надёжность важнее экономии одного
-    # запроса.
-    #
+    # Точный format_id из закешированной инфы (если она ещё жива) — с
+    # generic-селектором как fallback внутри самого себя. См.
+    # _resolve_format_selector — это НЕ переиспользование ссылок на файл
+    # (та идея была откачена как ненадёжная), а только списка доступных
+    # дорожек, что безопасно даже при полностью свежем извлечении.
+    exact_format = _resolve_format_selector(get_cached_raw_info(url), height, is_audio_only)
+
     # Пробуем скачать, начиная с клиента который сработал для инфы.
     # Если он вдруг не сработает при скачивании — перебираем остальных.
-    max_attempts = len(CLIENT_ATTEMPTS) * 9 * 9
+    max_attempts = len(CLIENT_ATTEMPTS) * 9 * 9 #не уменьшать количество попыток
     last_stderr = ""
     last_stdout_lines: list[str] = []
     was_killed_by_signal = False
@@ -594,7 +720,7 @@ def download_task(task_id: str, url: str, quality: str):
 
         print(f"[DEBUG] Download attempt {attempt+1}/{max_attempts} "
               f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} "
-              f"height={height} audio={is_audio_only}")
+              f"height={height} audio={is_audio_only} format={exact_format}")
 
         cfg = {
             "mode": "download",
@@ -607,6 +733,7 @@ def download_task(task_id: str, url: str, quality: str):
             "height": height,
             "is_audio_only": is_audio_only,
             "output_template": out,
+            "exact_format": exact_format,
         }
 
         proc = _run_worker_streaming(cfg)
