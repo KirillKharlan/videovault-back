@@ -3,3 +3,20 @@ services:
     name: videovault-server
     runtime: docker
     plan: free
+    envVars:
+      # Render отдаёт сюда "host:port" БЕЗ схемы (без http://) — сам
+      # добавляем схему в ytdlp_worker.py при чтении переменной, не здесь.
+      # Трафик между двумя сервисами одного аккаунта идёт по приватной сети
+      # Render, не через публичный интернет.
+      - key: POT_PROVIDER_URL
+        fromService:
+          name: videovault-pot-provider
+          type: web
+          property: hostport
+
+  - type: web
+    name: videovault-pot-provider
+    runtime: image
+    image:
+      url: docker.io/brainicism/bgutil-ytdlp-pot-provider:latest
+    plan: free

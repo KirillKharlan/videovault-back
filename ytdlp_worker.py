@@ -29,7 +29,18 @@ stderr CLI-вызова, так что вся классификация оши�
 """
 import sys
 import json
+import os
 import yt_dlp
+
+# Адрес отдельного Render-сервиса с bgutil-ytdlp-pot-provider (Node.js,
+# генерирует PO Token). На Render задаётся автоматически через fromService в
+# render.yaml — Render отдаёт "host:port" БЕЗ схемы, поэтому добавляем
+# http:// сами, если её ещё нет. Если переменная не задана вовсе — просто
+# работаем без PO Token провайдера (как раньше, только с formats=missing_pot
+# ниже).
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip()
+if POT_PROVIDER_URL and not POT_PROVIDER_URL.startswith(("http://", "https://")):
+    POT_PROVIDER_URL = f"http://{POT_PROVIDER_URL}"
 
 
 def _read_config() -> dict:
@@ -38,12 +49,28 @@ def _read_config() -> dict:
 
 
 def _common_opts(cfg: dict) -> dict:
+    youtube_args: dict = {
+        "player_client": [cfg["client"]],
+        # Без этого yt-dlp МОЛЧА выбрасывает форматы, для которых
+        # YouTube требует PO Token (Proof-of-Origin) — именно поэтому
+        # некоторые видео давали "0 форматов" без единой ошибки в логе.
+        # С этим флагом такие форматы всё равно попадают в список (они
+        # могут вернуть 403 при реальном скачивании — тогда сработает
+        # обычный fallback на следующего клиента/прокси, как и раньше),
+        # но хотя бы не пропадают полностью на шаге получения инфы.
+        "formats": ["missing_pot"],
+    }
     opts: dict = {
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": [cfg["client"]]}},
+        "extractor_args": {"youtube": youtube_args},
     }
+    if POT_PROVIDER_URL:
+        # Требует пакет bgutil-ytdlp-pot-provider (ставится в start.sh) —
+        # без него этот extractor_args просто игнорируется yt-dlp, плагин
+        # не подключится молча.
+        opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
     if cfg.get("verbose"):
         opts["verbose"] = True
     if cfg.get("use_cookies") and cfg.get("cookies_path"):

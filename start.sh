@@ -11,6 +11,13 @@ echo "[startup] Updating yt-dlp to latest..."
 pip install --quiet --upgrade yt-dlp yt-dlp-ejs
 echo "[startup] yt-dlp updated to: $(yt-dlp --version)"
 
+# PO Token provider (bgutil) — Python-плагин на стороне yt-dlp, который
+# обращается к отдельному Node.js-сервису (см. POT_PROVIDER_URL ниже) за
+# самими токенами. Без него yt-dlp просто не подключит поддержку PO Token
+# вообще, даже если POT_PROVIDER_URL задан.
+echo "[startup] Installing bgutil-ytdlp-pot-provider plugin..."
+pip install --quiet --upgrade bgutil-ytdlp-pot-provider
+
 echo "[startup] Starting gunicorn..."
 exec gunicorn app:app \
   --workers 1 \
