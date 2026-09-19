@@ -595,6 +595,15 @@ def _try_one_client_for_info(url: str, client_index: int) -> dict:
             print(f"[DEBUG]   live_status: {info.get('live_status')}")
             print(f"[DEBUG]   requires_premium: {info.get('requires_premium')}")
             print(f"[DEBUG]   playable_in_embed: {info.get('playable_in_embed')}")
+            # Раньше stderr воркера печатался ТОЛЬКО при явной ошибке
+            # (proc_returncode != 0) — а "пустые данные" технически считаются
+            # успехом (returncode 0), поэтому реальный verbose-вывод yt-dlp
+            # (где обычно прямо написана причина — "Sign in to confirm..." и
+            # т.п.) молча проглатывался. Печатаем его и здесь, раз
+            # DEBUG_VERBOSE включён.
+            if DEBUG_VERBOSE and stderr_data.strip():
+                print(f"[DEBUG] Verbose stderr for {label} (poor data):")
+                print(stderr_data[-_LOG_TAIL_CHARS:])
             return {"ok": False, "client_index": client_index, "proxy_used": proxy_used,
                     "err_type": "poor_data", "message": "Пустые данные от этого клиента"}
 
