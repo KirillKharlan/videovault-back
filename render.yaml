@@ -3,16 +3,11 @@ services:
     name: videovault-server
     runtime: docker
     plan: free
-    envVars:
-      # Render отдаёт сюда "host:port" БЕЗ схемы (без http://) — сам
-      # добавляем схему в ytdlp_worker.py при чтении переменной, не здесь.
-      # Трафик между двумя сервисами одного аккаунта идёт по приватной сети
-      # Render, не через публичный интернет.
-      - key: POT_PROVIDER_URL
-        fromService:
-          name: videovault-pot-provider
-          type: web
-          property: hostport
+    # POT_PROVIDER_URL задаётся ВРУЧНУЮ в Render → Environment (не через
+    # fromService — та связка ломается, если сервисы оказались в разных
+    # "Projects"/группах). Значение — публичный URL сервиса
+    # videovault-pot-provider ниже, например:
+    # https://videovault-pot-provider.onrender.com
 
   - type: web
     name: videovault-pot-provider
