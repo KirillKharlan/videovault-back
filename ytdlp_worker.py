@@ -114,7 +114,17 @@ def _format_bytes(n) -> str:
 
 
 def _make_progress_hook():
+    meta_sent = {"done": False}
+
     def hook(d: dict) -> None:
+        # Название сообщаем один раз, как только yt-dlp его узнал — скачивание
+        # теперь стартует параллельно с /api/info и может начаться раньше, чем
+        # название попало в кэш сервера (см. app.py, событие "meta").
+        if not meta_sent["done"]:
+            title = (d.get("info_dict") or {}).get("title")
+            if title:
+                meta_sent["done"] = True
+                _emit({"type": "meta", "title": title})
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             downloaded = d.get("downloaded_bytes") or 0

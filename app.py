@@ -471,6 +471,39 @@ def get_cached_raw_info(url: str) -> dict | None:
     return None
 
 
+# ── Параллельный режим: скачивание НЕ ждёт /api/info ────────────────────────
+# Приложение теперь запускает /api/info и /api/download одновременно. Поэтому
+# download_task больше не вызывает get_video_info() синхронно (иначе он либо
+# ждал бы инфо, либо запускал дублирующий перебор клиентов при пустом кэше) —
+# он только "подглядывает" в кэш: если инфо уже успела закешироваться, берёт
+# из неё название/клиент/форматы, если нет — стартует с дефолтами, а название
+# воркер сообщит сам (событие "meta").
+DEFINITIVE_ERROR_TYPES = ("private", "age_restricted", "geo_blocked", "not_found", "copyright")
+
+# Негативный кэш: если /api/info уже выяснил, что видео недоступно по
+# содержательной причине (приватное, возрастное, регион, удалено, права) —
+# запоминаем, чтобы параллельно идущее скачивание не долбило все попытки
+# впустую, а сразу завершилось с той же понятной ошибкой.
+_info_neg_cache: dict[str, tuple[float, dict]] = {}
+
+
+def peek_cached_info(url: str):
+    """(summary, client_index, raw_info) из кэша, либо None — БЕЗ запросов."""
+    with _info_cache_lock:
+        cached = _info_cache.get(url)
+        if cached and (time.time() - cached[0]) < INFO_CACHE_TTL:
+            return cached[1], cached[2], cached[3]
+    return None
+
+
+def peek_negative_info(url: str) -> dict | None:
+    with _info_cache_lock:
+        neg = _info_neg_cache.get(url)
+        if neg and (time.time() - neg[0]) < INFO_CACHE_TTL:
+            return neg[1]
+    return None
+
+
 def get_video_info(url: str, use_cache: bool = True) -> dict:
     # ── Проверяем кеш ────────────────────────────────────────────────────
     if use_cache:
@@ -487,8 +520,12 @@ def get_video_info(url: str, use_cache: bool = True) -> dict:
     if "error" not in result:
         with _info_cache_lock:
             _info_cache[url] = (time.time(), result, working_client, raw_info, proxy_used)
+            _info_neg_cache.pop(url, None)
         result = dict(result)
         result["_client_index"] = working_client
+    elif result.get("error_type") in DEFINITIVE_ERROR_TYPES:
+        with _info_cache_lock:
+            _info_neg_cache[url] = (time.time(), dict(result))
 
     return result
 
@@ -684,21 +721,21 @@ def _fetch_video_info_uncached(url: str) -> tuple[dict, int, dict | None, str | 
 
 def download_task(task_id: str, url: str, quality: str):
     update_task(task_id, status="fetching_info", percent=0,
-                step="Получение информации…", created_at=time.time())
+                step="Подготовка к загрузке…", created_at=time.time())
 
-    info = get_video_info(url)
-    if "error" in info:
-        update_task(task_id, status="error",
-                    error=info["error"], error_type=info.get("error_type", "unknown"))
-        return
-
-    title = info["title"]
-    # Клиент который сработал для получения инфы — используем его же для скачивания.
-    # Раньше здесь всегда брался клиент по умолчанию (индекс 0), даже если
-    # get_video_info нашёл рабочий вариант через другой клиент — из-за этого
-    # инфо получалось, а скачивание падало с "Unsupported URL".
-    working_client_index = info.get("_client_index", get_cached_client_index(url))
-    update_task(task_id, title=title, step="Подготовка к загрузке…")
+    # НЕ вызываем get_video_info() — скачивание стартует параллельно с
+    # /api/info и не должно ждать его (см. комментарий у peek_cached_info).
+    # Если инфо уже в кэше — используем название/клиент/форматы из неё, если
+    # нет — стартуем с дефолтами, а реальное название сообщит воркер.
+    cached = peek_cached_info(url)
+    if cached:
+        info_summary, cached_client_index, _raw = cached
+        title = info_summary.get("title") or "video"
+        working_client_index = cached_client_index
+        update_task(task_id, title=title, step="Подготовка к загрузке…")
+    else:
+        title = "video"
+        working_client_index = get_cached_client_index(url)  # глобально лучший клиент
 
     clean_q = re.sub(r"\D", "", quality)
     is_audio_only = quality.strip().lower() in ("mp3", "audio", "audio_only")
@@ -722,6 +759,14 @@ def download_task(task_id: str, url: str, quality: str):
     was_killed_by_signal = False
 
     for attempt in range(max_attempts):
+        # Параллельно идущий /api/info мог уже выяснить, что видео недоступно
+        # по содержательной причине — не тратим остальные попытки впустую.
+        neg = peek_negative_info(url)
+        if neg:
+            update_task(task_id, status="error", error=neg["error"],
+                        error_type=neg.get("error_type", "unknown"))
+            return
+
         client_index = (working_client_index + attempt) % len(CLIENT_ATTEMPTS)
         clients, use_cookies = CLIENT_ATTEMPTS[client_index % len(CLIENT_ATTEMPTS)]
         cookies_path = setup_cookies() if use_cookies else None
@@ -798,6 +843,11 @@ def download_task(task_id: str, url: str, quality: str):
                 if parts: update_task(task_id, step=" · ".join(parts))
             elif event.get("type") == "step":
                 update_task(task_id, step=event.get("text", ""))
+            elif event.get("type") == "meta":
+                # Реальное название от воркера — важно, когда скачивание
+                # стартовало раньше, чем инфо попала в кэш.
+                if event.get("title"):
+                    update_task(task_id, title=event["title"])
 
         stderr_out = proc.stderr.read()
         proc.wait()
