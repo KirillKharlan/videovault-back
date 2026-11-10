@@ -1,94 +1,138 @@
 # 🗺️ КАРТА ПРОЕКТА — videovault-backend
 
-> Этот файл — для быстрой ориентации (в том числе для Claude), чтобы не
-> пересматривать все файлы при каждом фиксе. Обновляй его при структурных
-> изменениях.
+> Быстрая ориентация (в том числе для Claude), чтобы не перечитывать код при каждом фиксе.
+> Обновляй при структурных изменениях. Последняя сверка с кодом: ноябрь 2026.
+> Англоязычный контекст для Claude — `claude/claude.md`.
 
 ## Структура
 
 ```
 videovault-backend/
-├── app.py                 ← ВЕСЬ backend в одном файле (Flask)
-├── requirements.txt        ← Python-зависимости (flask, gunicorn; yt-dlp НЕ здесь)
-├── Dockerfile               ← сборка образа для Render
-├── start.sh                 ← точка входа: обновляет yt-dlp, потом запускает gunicorn
-├── render.yaml               ← конфиг деплоя Render (Docker runtime)
-├── README_DEPLOY.md           ← инструкция по деплою и cookies
-└── encoded_cookies.txt / www.youtube.com_cookies.txt
-                               ← ЛОКАЛЬНЫЕ файлы для генерации YT_COOKIES_B64,
-                                 на сервер НЕ заливаются (используются вручную
-                                 чтобы получить base64 и вставить в Render env)
+├── app.py              ← весь backend (Flask, ~1000 строк)
+├── ytdlp_worker.py     ← yt-dlp как библиотека, запускается app.py как ПОДПРОЦЕСС
+├── start.sh            ← точка входа: обновляет yt-dlp и bgutil-плагин, затем gunicorn
+├── Dockerfile          ← python:3.11-slim + ffmpeg + Deno + pinned flask/flask-cors/gunicorn
+├── render.yaml         ← два сервиса Render: videovault-server и videovault-pot-provider
+├── requirements.txt    ← справочный (см. ниже), Docker-сборка его НЕ использует
+├── README_DEPLOY.md    ← инструкция по деплою
+└── *cookies*.txt       ← ЛОКАЛЬНЫЕ секреты для получения YT_COOKIES_B64 (на сервер не заливаются)
 ```
 
-## app.py — карта разделов (внутри одного файла)
+## Архитектура
 
-Порядок сверху вниз:
+- `app.py` (gunicorn: 1 воркер, 8 потоков `--threads 8`, 300 с таймаут) **не импортирует yt-dlp**. На каждую операцию он запускает
+  `ytdlp_worker.py` отдельным процессом. Если видео убьёт процесс по памяти (OOM), погибнет только воркер:
+  родитель увидит `returncode < 0` и включит понижение качества.
+- Протокол воркера: конфиг приходит одной JSON-строкой в stdin; результат — JSON-события построчно в stdout
+  (`info`, `progress`, `step`, `postprocess`…); ошибки — текст исключения в stderr, его разбирает `classify_error()`.
+- Режимы воркера: `info` (метаданные без скачивания), `download` (извлечение + скачивание в файл за один проход,
+  фрагменты в 4 потока) и `stream` (байты одиночного mp4 пишутся прямо в stdout, см. «Прямая выдача»). Идея «переиспользовать ссылки из /api/info при скачивании» откатана: ссылки протухают.
+  Info и download идут параллельно и независимо.
+- Задачи хранятся в `tasks.json` рядом с `app.py` (не в памяти), чтобы переживать рестарт.
+- Файлы лежат в `<tmp>/videovault`; фоновый `cleanup_loop` удаляет старые файлы и задачи (старше ~2 ч).
 
-1. **Импорты + Flask init** — CORS открыт на все origins, request logging (`@app.before_request`)
-2. **Пути**: `TMP_DIR` (видео/файлы), `TASKS_FILE` (json на диске — переживает
-   рестарт/sleep сервера), `COOKIES_FILE`
-3. **Хранение задач на диске** (`load_tasks`, `save_tasks`, `get_task`,
-   `set_task`, `update_task`) — без кеша в памяти, всегда читают/пишут файл.
-   Это специально: чтобы задачи не терялись при рестарте gunicorn.
-4. **`setup_cookies()`** — пишет `cookies.txt` из env `YT_COOKIES_B64`
-   (base64). Атомарная запись (tmp-файл + rename). Не перезаписывает если
-   файл уже есть и не пустой.
-5. **Очистка старых файлов** — фоновый поток, чистит видео/задачи старше 2ч
-6. **`ERROR_PATTERNS` / `classify_error()`** — сопоставляет сырой stderr
-   yt-dlp с понятным сообщением для пользователя (bot/private/format/
-   unsupported и т.д.)
-7. **`CLIENT_SETS`** — список наборов YouTube player-клиентов
-   (`ios`, `android`, `web,mweb`, `tv_embedded`), перебираются по очереди
-   при неудаче. Порядок важен: мобильные клиенты (ios/android) первые,
-   т.к. лучше работают с YouTube Shorts.
-8. **`ytdlp_base_args(client_set_index)`** — собирает базовые аргументы
-   yt-dlp CLI с нужным набором клиентов + cookies
-9. **Кеш инфо о видео** (`_info_cache`, TTL 10 мин) — ключ: URL,
-   значение: `(timestamp, info_dict, working_client_index)`.
-   Важно: сохраняет **какой именно клиент сработал**, чтобы скачивание
-   потом начиналось с того же клиента, а не с дефолтного.
-10. **`get_video_info(url)`** — публичная точка входа, проверяет кеш,
-    иначе зовёт `_fetch_video_info_uncached`
-11. **`_fetch_video_info_uncached(url, client_index, attempts_left)`** —
-    рекурсивно перебирает `CLIENT_SETS` пока не получит вменяемые данные
-    (проверяет что duration>0 или есть качества — иначе тоже считает
-    неудачей и пробует следующего клиента)
-12. **`download_task(task_id, url, quality)`** — фоновая задача:
-    - берёт `working_client_index` из кеша инфо (тот же клиент что сработал)
-    - цикл `for attempt in range(max_attempts)` — перебирает клиентов начиная
-      с рабочего, если скачивание вдруг не удаётся
-    - парсит прогресс из stdout yt-dlp построчно, обновляет `update_task`
-    - при успехе — `status=done`, при неудаче после всех попыток — `status=error`
-13. **API роуты**:
-    - `GET /health` — версия yt-dlp, наличие cookies, кол-во задач
-    - `POST /api/info` — вызывает `get_video_info`, отдаёт JSON (без
-      служебного поля `_client_index`)
-    - `POST /api/download` — создаёт task_id, запускает `download_task` в
-      отдельном потоке, сразу возвращает task_id
-    - `GET /api/progress/<task_id>` — статус задачи
-    - `GET /api/file/<task_id>` — отдаёт готовый файл
+## API
 
-## Известные особенности / грабли
+| Маршрут | Назначение |
+|---|---|
+| `GET /health` | `ok`, версии yt-dlp и Deno, наличие cookies, `debug_verbose`, число прокси, прокси на cooldown, число задач |
+| `POST /api/info` `{url, refresh?}` | `title`, `thumbnail`, `duration`, `uploader`, `platform`, `qualities[]` (строки; иначе `["best"]`), `quality_sizes{высота: байты}` (оценка, есть не для всех). `refresh: true` — мимо кэша. Служебные поля с `_` скрыты. Ошибка: 400 `{error, error_type}` |
+| `POST /api/fetch` `{url, quality}` | **основной путь клиента**: один запрос — сразу видео. Ответ: `video/mp4` потоком (заголовки `X-File-Size` — оценка, `X-Title` — percent-encoded название) **или** JSON `{"mode":"task","task_id"}` (запасной путь) **или** 400 `{error, error_type}` |
+| `POST /api/download` `{url, quality}` | создаёт `task_id`, запускает `download_task` в потоке. `quality`: `"best"`, число (`"720"`) или `mp3`/`audio`/`audio_only` |
+| `GET /api/progress/<id>` | поля задачи без `file_path`: `status`, `percent`, `step`, `title`, `filename`, `error`, `error_type`, `error_detail`, `created_at`; 404 `not_found`, если задачи нет |
+| `GET /api/file/<id>` | отдаёт файл (`audio/mpeg` для mp3, иначе `video/mp4`), только при `status == done` |
 
-- **Render free plan засыпает** через 15 мин простоя — первый запрос будит
-  сервер ~15-30 сек. Flutter должен иметь таймауты 90+ сек на первый запрос.
-- **yt-dlp обновляется в `start.sh`**, НЕ в requirements.txt — так он всегда
-  последней версии при каждом деплое/рестарте.
-- **Задачи хранятся в файле**, не в памяти — переживают рестарт процесса.
-- **YouTube Shorts** могут отдавать пустые formats/duration с некоторыми
-  клиентами (tv_embedded/web_creator) — поэтому mobile-клиенты идут первыми
-  в `CLIENT_SETS`, и есть проверка "poor data" которая триггерит fallback.
-- **Cookies обязательны** для стабильной работы — без них YouTube помечает
-  запросы с IP дата-центра Render как ботов.
+### Прямая выдача (`/api/fetch`)
+
+Работает, только если выполнены ВСЕ условия (`_plan_stream`): есть кэш `/api/info` для ссылки (10 мин), не mp3, и в
+списке форматов есть одиночный (видео+аудио) mp4 по http(s), который по высоте не хуже лучшей отдельной видеодорожки
+(иначе склейка даст лучшую картинку, например YouTube 720p+). Типичные случаи: TikTok, Instagram, YouTube 360p.
+
+1. `_open_stream` перебирает клиентов и прокси ДО первого байта: до `STREAM_MAX_ATTEMPTS = 3` попыток по
+   `STREAM_FIRST_BYTE_TIMEOUT = 45` с. Воркер в режиме `stream` пишет mp4 в stdout, `_StreamSession` вычитывает его
+   в ограниченную очередь (противодавление: медленный клиент притормаживает yt-dlp).
+2. Получили первый байт: отвечаем `video/mp4` (chunked), `_stream_body` отдаёт данные по мере поступления.
+   Воркер умер или завис посреди потока (`STALL_TIMEOUT`) → генератор бросает исключение, соединение рвётся без
+   финального chunk, клиент видит ошибку (неполный файл за успешный не принимается).
+3. Содержательная ошибка про само видео (приватное, удалено…) → 400 JSON. Любая другая неудача, нет кэша, mp3, нужна
+   склейка → ответ `{"mode":"task"}` и работает прежняя схема (`download_task` + `/api/progress` + `/api/file`).
+4. Клиент отключился → генератор закрывается, процесс воркера убивается.
+
+Фрагменты в 4 потока и OOM-лесенка качества в прямом режиме не применяются (файл не склеивается и не копится на диске).
+
+Статусы задачи: `queued` → `fetching_info` → `downloading` → `done` | `error`.
+Прогресс не доходит до 100 до завершения: во время загрузки `percent ≤ 95`.
+
+## app.py — карта разделов (сверху вниз)
+
+1. Импорты, Flask, CORS (открыт для всех источников), логирование запросов; `DEBUG_VERBOSE` задаёт длину хвоста логов (800 / 6000 символов).
+2. Пути: `TMP_DIR`, `WORKER_SCRIPT`, `TASKS_FILE`, `COOKIES_FILE`; `INFO_CACHE_TTL = 600`; `STALL_TIMEOUT = 90`.
+3. «Глобально лучший клиент»: `_record_client_success`, `_get_global_best_client_index` — начинать перебор с последнего рабочего.
+4. Хранилище задач: `load_tasks`, `save_tasks`, `get_task`, `set_task`, `update_task` (всегда читают/пишут файл).
+5. `setup_cookies()` — пишет `cookies.txt` из `YT_COOKIES_B64` (атомарно).
+6. `reconcile_stale_tasks()` — после рестарта помечает зависшие задачи ошибкой; `cleanup_loop()`.
+7. `ERROR_PATTERNS` / `classify_error()` — сырой stderr → тип и текст для пользователя. Типы:
+   `cookies_expired`, `bot`, `player`, `format`, `private`, `age_restricted`, `geo_blocked`, `not_found`,
+   `copyright`, `unsupported`, `network`, `proxy_quota`, иначе `unknown`.
+8. **`CLIENT_ATTEMPTS`** — список попыток `(клиент, use_cookies)`:
+   `ios`, `android`, `mweb`, `web`, `tv` (все **без** cookies), затем `web` и `tv` **с** cookies.
+   Cookies поставлены в конец намеренно: с IP дата-центра протухшая сессия подозрительнее анонимного запроса.
+9. `QUALITY_LADDER` (2160 → 240) и `_next_lower_quality()` — понижение качества при OOM.
+10. Пул прокси: `_load_proxy_pool` (`YT_PROXIES` / `YT_PROXY`), `select_proxy` (ротация), `mark_proxy_account_dead`
+    (аккаунт на 402 уходит на cooldown 6 ч).
+11. Выбор формата: `_best_video_format_id`, `_best_audio_format_id`, `_resolve_format_selector`
+    (точный format_id из кэша, иначе общий селектор).
+12. Кэш инфо и негативный кэш: `get_cached_raw_info`, `peek_cached_info`, `peek_negative_info`, `get_video_info`.
+    `DEFINITIVE_ERROR_TYPES` (`private`, `age_restricted`, `geo_blocked`, `not_found`, `copyright`) не ретраятся.
+13. Запуск воркера: `_run_worker_once`, `_run_worker_streaming`.
+14. Перебор клиентов для инфо: `_try_one_client_for_info`, `_quality_sizes`, `_client_order`, `_fetch_video_info_uncached`
+    (партии по `INFO_PARALLEL_BATCH = 3` параллельно; «бедные» данные без duration/qualities считаются неудачей клиента —
+    важно для Shorts). **Выбирается не первый успешный ответ, а лучший по набору качеств** (`_info_rank`): клиенты YouTube
+    отдают разные форматы (один может вернуть только `best` или 240p, другой — до 4K). Ответ с качеством ≥ `INFO_GOOD_HEIGHT = 720`
+    возвращается сразу; иначе ждём остальных клиентов партии `INFO_GRACE_SECONDS = 8` с, при необходимости пробуем вторую партию
+    (`INFO_MAX_QUALITY_BATCHES = 2`, не начинаем новую, если прошло > `INFO_QUALITY_SEARCH_BUDGET = 35` с). Клиент запоминается как
+    «лучший глобально» только если дал ≥ 480p. Реально низкокачественные видео поэтому отвечают дольше (до ~20–35 с, один раз — потом кэш).
+15. **`download_task(task_id, url, quality)`** — фоновое скачивание: старт с рабочего клиента, перебор клиентов и
+    прокси, понижение качества при OOM, зависание >90 с без прогресса убивает попытку.
+    **`max_attempts = len(CLIENT_ATTEMPTS) * 20`** (сейчас 140). Не уменьшать без явной просьбы владельца.
+16. Прямая выдача: `_plan_stream`, `_run_worker_binary`, `_StreamSession`, `_open_stream`, `_stream_body`
+    (`STREAM_*` константы).
+17. Маршруты (раздел «API» выше), `/api/fetch` — `api_fetch`.
+
+## ytdlp_worker.py
+
+`_read_config` → `_common_opts` (клиент, `formats: missing_pot`, noplaylist, cookies, прокси, PO-token провайдер)
+→ `run_info` / `run_download` (`_download_opts`, хуки прогресса и постпроцессинга) → `_emit` JSON-событий.
+Режим `stream` (`run_stream`): `outtmpl = "-"`, `logtostderr`, в stdout только байты видео, ничего другого печатать нельзя.
+`noplaylist = True` — именно его надо снять для будущей фичи «скачать плейлист».
+
+## Деплой и окружение
+
+| Переменная | Назначение |
+|---|---|
+| `YT_COOKIES_B64` | base64 cookies YouTube (в коде используются в последних попытках; быстро протухают) |
+| `POT_PROVIDER_URL` | URL сервиса `videovault-pot-provider`; задаётся **вручную** (не `fromService`); схема `http://` добавляется, если её нет |
+| `YT_PROXIES` / `YT_PROXY` | пул прокси через запятую / один прокси |
+| `DEBUG_VERBOSE` | `1`/`true`/`yes` — длинные хвосты stderr в логах |
+| `PORT` | задаёт Render (по умолчанию 8000) |
+
+Подробности — в `README_DEPLOY.md`.
+
+## Известные особенности
+
+- Render free засыпает через ~15 минут простоя; первый запрос 15–30 с (клиент держит таймаут 90 с). RAM 512 МБ.
+- yt-dlp обновляется в `start.sh` при каждом старте и **не закреплён**: ломающий релиз может положить прод при рестарте.
+- Deno обязателен (расшифровка сигнатур, `yt-dlp-ejs`), без него — «Failed to extract any player response».
+- Shorts на некоторых клиентах отдают пустые formats/duration: «бедный» ответ = неудача клиента.
+- `--workers 1` намеренно (общий `tasks.json` и кэши в процессе); не увеличивать без проверки. `--threads 8`
+  обязателен: без него (одиночный sync-воркер) один потоковый ответ блокировал бы все остальные запросы.
+- Spotify скачать нельзя (DRM).
 
 ## Что смотреть при новой ошибке
 
-1. Сначала — тип ошибки в UI (текст из `ERROR_PATTERNS`)
-2. Если "unsupported"/"формат недоступен" на конкретном видео — скорее
-   всего проблема в `CLIENT_SETS` или в fallback-логике `download_task`
-3. Если "cookies"/"bot" — смотри `setup_cookies()` и переменную
-   `YT_COOKIES_B64` на Render
-4. Если "задача не найдена" — смотри `load_tasks`/`save_tasks`, возможно
-   сервер перезапустился в процессе (см. логи Render на предмет рестарта)
-5. Логи Render показывают `[DEBUG]` строки с точным stderr от yt-dlp —
-   всегда проси их у пользователя при новой ошибке, это экономит время
+1. Тип ошибки в UI → `ERROR_PATTERNS`.
+2. «unsupported» / «формат недоступен» на одном видео → `_fetch_video_info_uncached`, `download_task`, PO-token сервис.
+3. «cookies» / «bot» → `setup_cookies()`, `YT_COOKIES_B64`, свежесть cookies.
+4. «Задача не найдена» → рестарт посреди задачи: `reconcile_stale_tasks`, логи Render.
+5. Ошибка прокси (402) → аккаунт на cooldown 6 ч, проверь `YT_PROXIES`, `/health`.
+6. Всегда проси логи Render: строки `[DEBUG]` содержат точный stderr yt-dlp.

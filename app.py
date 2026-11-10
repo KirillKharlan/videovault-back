@@ -6,7 +6,7 @@ Fixes:
 """
 
 import os, sys, json, threading, subprocess, time, uuid, tempfile, re, base64, queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 # ── Режим подробной диагностики ─────────────────────────────────────────────
 # Включается переменной окружения DEBUG_VERBOSE=1 на Render (Environment →
@@ -19,7 +19,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DEBUG_VERBOSE = os.environ.get("DEBUG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
 _LOG_TAIL_CHARS = 6000 if DEBUG_VERBOSE else 800
 from pathlib import Path
-from flask import Flask, request, jsonify, send_file, abort
+from urllib.parse import quote
+from flask import Flask, request, jsonify, send_file, abort, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -579,6 +580,43 @@ def _run_worker_streaming(cfg: dict) -> subprocess.Popen:
     return proc
 
 
+def _quality_sizes(formats: list[dict], duration: int) -> dict[str, int]:
+    """Оценка размера итогового файла по каждой высоте: размер лучшей
+    видеодорожки этой высоты (+ лучшая аудиодорожка, если видео отдельно).
+    Размер берётся из filesize / filesize_approx, иначе tbr × длительность.
+    Высоты без оценки в результат не попадают."""
+    def vc(f): return (f.get("vcodec") or "none")
+    def ac(f): return (f.get("acodec") or "none")
+
+    def size_of(f: dict) -> int | None:
+        sz = f.get("filesize") or f.get("filesize_approx")
+        if not sz and f.get("tbr") and duration:
+            sz = f["tbr"] * 1000 / 8 * duration
+        return int(sz) if sz else None
+
+    audio = [f for f in formats if ac(f) != "none" and vc(f) == "none"]
+    best_audio = max(audio, key=lambda f: (f.get("ext") == "m4a", f.get("abr") or 0), default=None)
+    audio_size = (size_of(best_audio) if best_audio else None) or 0
+
+    by_height: dict[int, list[dict]] = {}
+    for f in formats:
+        h = f.get("height")
+        if h and h >= 240 and vc(f) != "none":
+            by_height.setdefault(h, []).append(f)
+
+    out: dict[str, int] = {}
+    for h, fs in by_height.items():
+        best = max(fs, key=lambda f: (1 if (f.get("ext") == "mp4" or "avc" in vc(f)) else 0,
+                                      f.get("tbr") or 0))
+        sz = size_of(best)
+        if sz is None:
+            continue
+        if ac(best) == "none":
+            sz += audio_size
+        out[str(h)] = sz
+    return out
+
+
 def _try_one_client_for_info(url: str, client_index: int) -> dict:
     """Одна попытка получить инфо через ОДИН конкретный клиент — вынесена в
     отдельную функцию, чтобы запускать несколько таких попыток ОДНОВРЕМЕННО
@@ -652,6 +690,9 @@ def _try_one_client_for_info(url: str, client_index: int) -> dict:
             "uploader":  info.get("uploader", ""),
             "platform":  info.get("extractor_key", "").lower(),
             "qualities": [str(q) for q in sorted_q] or ["best"],
+            # Оценка размера файла для каждого качества (байты), если известна —
+            # приложение показывает её в выборе качества.
+            "quality_sizes": _quality_sizes(raw_formats, duration),
         }
         return {"ok": True, "client_index": client_index, "proxy_used": proxy_used,
                 "summary": summary, "raw_info": info}
@@ -680,39 +721,91 @@ def _client_order(start_index: int) -> list[int]:
     return [(start_index + i) % n for i in range(n)]
 
 
+# Разные клиенты YouTube отдают РАЗНЫЙ набор форматов: один может вернуть
+# метаданные вообще без форматов (в списке остаётся "best") или единственный
+# формат 240p, другой — полный список до 4K. Раньше первый успешный ответ
+# принимался сразу, поэтому в приложение попадал урезанный список, а такой
+# клиент ещё и запоминался как «лучший». Теперь «достаточно хорошим» считается
+# ответ с качеством от INFO_GOOD_HEIGHT; иначе ждём остальных клиентов партии
+# ещё INFO_GRACE_SECONDS, при необходимости пробуем вторую партию и берём
+# лучший результат (по максимальной высоте, затем по числу качеств).
+INFO_GOOD_HEIGHT = 720
+INFO_GRACE_SECONDS = 8
+INFO_MAX_QUALITY_BATCHES = 2
+INFO_QUALITY_SEARCH_BUDGET = 35   # не начинаем новую партию, если прошло больше (клиент ждёт ответ ~90 с)
+
+
+def _info_rank(res: dict) -> tuple[int, int]:
+    """(максимальная высота, число качеств) результата; «best» = 0."""
+    qs = (res.get("summary") or {}).get("qualities") or []
+    nums = [int(q) for q in qs if str(q).isdigit()]
+    return (max(nums) if nums else 0, len(nums))
+
+
 def _fetch_video_info_uncached(url: str) -> tuple[dict, int, dict | None, str | None]:
     """Перебирает клиентов ПАРТИЯМИ по INFO_PARALLEL_BATCH штук одновременно
-    (вместо строго по одному) — берём первый успешный ответ в партии и сразу
-    возвращаем, не дожидаясь остальных. Начинаем не с клиента №0, а с
-    глобально последнего рабочего (см. _get_global_best_client_index)."""
+    (вместо строго по одному). Начинаем не с клиента №0, а с глобально
+    последнего рабочего (см. _get_global_best_client_index). Возвращает не
+    просто первый успешный ответ, а лучший по набору качеств (см. выше)."""
+    t0 = time.time()
     order = _client_order(_get_global_best_client_index())
     last_err_type, last_message = "unknown", "Не удалось получить информацию о видео"
+    best: dict | None = None
 
     i = 0
+    batches_done = 0
     while i < len(order):
         batch = order[i:i + INFO_PARALLEL_BATCH]
         ex = ThreadPoolExecutor(max_workers=len(batch))
-        futures = [ex.submit(_try_one_client_for_info, url, ci) for ci in batch]
+        pending = {ex.submit(_try_one_client_for_info, url, ci) for ci in batch}
+        first_ok_at = None
         try:
-            for fut in as_completed(futures):
-                res = fut.result()
-                if res["ok"]:
-                    _record_client_success(res["client_index"])
-                    return res["summary"], res["client_index"], res["raw_info"], res["proxy_used"]
-                if res["err_type"] in ("private", "age_restricted", "geo_blocked", "not_found", "copyright"):
-                    # Содержательная ошибка про само видео (не про клиента) —
-                    # дальше пробовать смысла нет, ни в этой партии, ни в следующих.
-                    return ({"error": res["message"], "error_type": res["err_type"]},
-                            res["client_index"], None, res["proxy_used"])
-                last_err_type, last_message = res["err_type"], res["message"]
+            while pending:
+                timeout = (None if first_ok_at is None
+                           else max(0.0, INFO_GRACE_SECONDS - (time.time() - first_ok_at)))
+                done, pending = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                if not done:
+                    break  # время ожидания остальных клиентов после первого успеха вышло
+                for fut in done:
+                    res = fut.result()
+                    if res["ok"]:
+                        if first_ok_at is None:
+                            first_ok_at = time.time()
+                        if best is None or _info_rank(res) > _info_rank(best):
+                            best = res
+                    elif best is None and res["err_type"] in DEFINITIVE_ERROR_TYPES:
+                        # Содержательная ошибка про само видео (не про клиента) —
+                        # дальше пробовать смысла нет.
+                        return ({"error": res["message"], "error_type": res["err_type"]},
+                                res["client_index"], None, res["proxy_used"])
+                    elif not res["ok"]:
+                        last_err_type, last_message = res["err_type"], res["message"]
+                if best is not None and _info_rank(best)[0] >= INFO_GOOD_HEIGHT:
+                    break
         finally:
-            # wait=False — не блокируем возврат результата, пока "лишние"
-            # (уже не нужные, раз кто-то в партии сработал) потоки в фоне
-            # доработают сами по себе и результат отбросится.
+            # wait=False — не блокируем возврат результата: «лишние» потоки
+            # доработают в фоне сами, их результат отбросится.
             ex.shutdown(wait=False, cancel_futures=True)
+
+        batches_done += 1
+        if best is not None:
+            good = _info_rank(best)[0] >= INFO_GOOD_HEIGHT
+            out_of_budget = (time.time() - t0) > INFO_QUALITY_SEARCH_BUDGET
+            if good or batches_done >= INFO_MAX_QUALITY_BATCHES or out_of_budget:
+                break
         i += INFO_PARALLEL_BATCH
         if i < len(order):
             time.sleep(1.0)
+
+    if best is not None:
+        height, count = _info_rank(best)
+        print(f"[DEBUG] Info chosen: client[{best['client_index']}] max_height={height} "
+              f"qualities_count={count} after {time.time() - t0:.1f}s")
+        # Запоминаем клиента глобально только если он реально дал нормальный
+        # набор — иначе урезанный клиент закрепился бы «лучшим» навсегда.
+        if height >= 480:
+            _record_client_success(best["client_index"])
+        return best["summary"], best["client_index"], best["raw_info"], best["proxy_used"]
 
     return {"error": last_message, "error_type": last_err_type}, (order[-1] if order else 0), None, None
 
@@ -916,6 +1009,212 @@ def download_task(task_id: str, url: str, quality: str):
                 error_detail=last_stderr[-500:])
 
 
+# ── Прямая выдача: ОДИН запрос — видео идёт сразу по мере скачивания ─────────
+# POST /api/fetch. Если у видео есть готовый одиночный mp4-файл по http(s)
+# (TikTok, Instagram, YouTube 360p и т.п.) без потери качества относительно
+# обычной схемы «видео + аудио с склейкой», yt-dlp пишет его прямо в stdout
+# воркера, а мы тут же отдаём эти байты клиенту (chunked) — телефон получает
+# файл параллельно со скачиванием сервером, без промежуточного файла на диске.
+#
+# Если прямой путь не подходит (нужна склейка видео+аудио, mp3, нет кэша инфо)
+# или не завёлся за несколько попыток ДО первого байта — отвечаем JSON
+# {"mode": "task", "task_id": ...} и работает прежняя схема (download_task +
+# /api/progress + /api/file) целиком, как раньше. Прямой путь ничего не
+# ломает: в худшем случае это потерянные секунды перед запасным путём.
+STREAM_FIRST_BYTE_TIMEOUT = 45   # ждём первый байт от воркера, сек
+STREAM_MAX_ATTEMPTS = 3          # попыток прямого пути до перехода к задаче
+STREAM_CHUNK = 64 * 1024
+
+
+def _plan_stream(raw_info: dict | None, height: int | None, is_audio_only: bool) -> dict | None:
+    """Решает, можно ли отдать видео прямым потоком БЕЗ потери качества.
+    Нужен одиночный (видео+аудио в одном файле) mp4 по http(s), и он не должен
+    уступать по высоте лучшей отдельной видеодорожке (иначе обычная схема
+    со склейкой даст картинку лучше — например, YouTube 720p+)."""
+    if is_audio_only:
+        return None
+    formats = (raw_info or {}).get("formats") or []
+    if not formats:
+        return None
+
+    def vc(f): return (f.get("vcodec") or "none")
+    def ac(f): return (f.get("acodec") or "none")
+
+    combined = [f for f in formats
+                if vc(f) != "none" and ac(f) != "none" and f.get("ext") == "mp4"
+                and str(f.get("protocol") or "").startswith("http") and f.get("height")]
+    if height:
+        combined = [f for f in combined if f["height"] <= height]
+    if not combined:
+        return None
+    best = max(combined, key=lambda f: (f["height"], f.get("tbr") or 0))
+
+    video_only = [f for f in formats if vc(f) != "none" and ac(f) == "none" and f.get("height")]
+    if height:
+        video_only = [f for f in video_only if f["height"] <= height]
+    best_video_h = max((f["height"] for f in video_only), default=0)
+    if best["height"] < best_video_h:
+        return None
+
+    selector = "best[ext=mp4][protocol^=http][vcodec!=none][acodec!=none]"
+    if height:
+        selector += f"[height<={height}]"
+    size = best.get("filesize") or best.get("filesize_approx")
+    return {"selector": selector, "height": best["height"],
+            "size": int(size) if size else None}
+
+
+def _run_worker_binary(cfg: dict) -> subprocess.Popen:
+    """Как _run_worker_streaming, но stdout/stderr БИНАРНЫЕ: в режиме stream
+    по stdout идут байты самого видео, а не JSON-строки."""
+    proc = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    proc.stdin.write(json.dumps(cfg, ensure_ascii=False).encode("utf-8"))
+    proc.stdin.close()
+    return proc
+
+
+class _StreamSession:
+    """Обёртка над воркером в режиме stream: отдельные потоки вычитывают
+    stdout (в ограниченную очередь — даёт естественное противодавление:
+    медленный клиент притормаживает yt-dlp, память не растёт) и stderr
+    (иначе забитый pipe stderr мог бы подвесить процесс)."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+        self.q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=16)
+        self.stop = threading.Event()
+        self._err_lines: list[str] = []
+        self._out_thread = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._err_thread = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._out_thread.start()
+        self._err_thread.start()
+
+    def _put(self, item) -> None:
+        while not self.stop.is_set():
+            try:
+                self.q.put(item, timeout=1)
+                return
+            except queue.Full:
+                continue
+
+    def _pump_stdout(self) -> None:
+        try:
+            while not self.stop.is_set():
+                chunk = self.proc.stdout.read1(STREAM_CHUNK)
+                if not chunk:
+                    break
+                self._put(chunk)
+        except Exception:
+            pass
+        finally:
+            self._put(None)  # сигнал конца потока
+
+    def _pump_stderr(self) -> None:
+        try:
+            for raw in self.proc.stderr:
+                self._err_lines.append(raw.decode("utf-8", errors="replace").rstrip())
+                if len(self._err_lines) > 60:
+                    del self._err_lines[:-60]
+        except Exception:
+            pass
+
+    def stderr_text(self) -> str:
+        self._err_thread.join(timeout=2)
+        return "\n".join(self._err_lines)
+
+    def close(self) -> None:
+        self.stop.set()
+        try:
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+        for pipe in (self.proc.stdout, self.proc.stderr):
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+
+def _open_stream(url: str, plan: dict):
+    """Пытается завести прямой поток: перебирает клиентов/прокси ДО первого
+    байта. Возвращает (session, first_chunk, None) при успехе,
+    (None, None, {"error", "error_type"}) при содержательной ошибке про само
+    видео (приватное, удалено и т.п.) и (None, None, None), если прямой путь не
+    завёлся — тогда вызывающий уходит на запасную схему с задачей."""
+    start = get_cached_client_index(url)
+    for attempt in range(STREAM_MAX_ATTEMPTS):
+        neg = peek_negative_info(url)
+        if neg:
+            return None, None, {"error": neg["error"], "error_type": neg.get("error_type", "unknown")}
+
+        client_index = (start + attempt) % len(CLIENT_ATTEMPTS)
+        clients, use_cookies = CLIENT_ATTEMPTS[client_index]
+        cookies_path = setup_cookies() if use_cookies else None
+        proxy_used = select_proxy()
+        print(f"[DEBUG] Stream attempt {attempt+1}/{STREAM_MAX_ATTEMPTS} "
+              f"attempt[{client_index}]={CLIENT_ATTEMPTS[client_index]} format={plan['selector']}")
+
+        cfg = {
+            "mode": "stream", "url": url, "client": clients,
+            "use_cookies": use_cookies, "cookies_path": cookies_path,
+            "proxy": proxy_used, "verbose": DEBUG_VERBOSE,
+            "format": plan["selector"],
+        }
+        sess = _StreamSession(_run_worker_binary(cfg))
+        try:
+            first = sess.q.get(timeout=STREAM_FIRST_BYTE_TIMEOUT)
+        except queue.Empty:
+            print(f"[DEBUG] Stream attempt {attempt+1}: нет данных {STREAM_FIRST_BYTE_TIMEOUT}s — следующая")
+            sess.close()
+            continue
+
+        if first is None:  # воркер завершился, не отдав ни байта
+            try:
+                sess.proc.wait(timeout=10)
+            except Exception:
+                pass
+            err_text = sess.stderr_text()
+            sess.close()
+            err_type, message = classify_error(err_text)
+            print(f"[DEBUG] Stream attempt {attempt+1} FAILED ({err_type}): {err_text[-_LOG_TAIL_CHARS:]}")
+            if err_type == "proxy_quota" and proxy_used:
+                mark_proxy_account_dead(proxy_used)
+            if err_type in DEFINITIVE_ERROR_TYPES:
+                return None, None, {"error": message, "error_type": err_type}
+            time.sleep(1.0)
+            continue
+
+        _record_client_success(client_index)
+        return sess, first, None
+    return None, None, None
+
+
+def _stream_body(sess: "_StreamSession", first: bytes):
+    """Генератор тела ответа. Если воркер умирает/зависает посреди потока —
+    бросаем исключение: соединение рвётся без финального chunk, и клиент видит
+    ошибку (неполный файл за успех принят не будет)."""
+    try:
+        yield first
+        while True:
+            try:
+                chunk = sess.q.get(timeout=STALL_TIMEOUT)
+            except queue.Empty:
+                raise RuntimeError(f"stream stalled: нет данных {STALL_TIMEOUT}s")
+            if chunk is None:
+                break
+            yield chunk
+        rc = sess.proc.wait(timeout=30)
+        if rc != 0:
+            raise RuntimeError(f"stream worker exit code {rc}: {sess.stderr_text()[-300:]}")
+    finally:
+        sess.close()
+
+
 # ── API ───────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -956,7 +1255,8 @@ def api_info():
     url = (request.json or {}).get("url", "").strip()
     if not url:
         return jsonify({"error": "❌ URL не указан", "error_type": "validation"}), 400
-    result = get_video_info(url)
+    # refresh=true — игнорировать кэш (кнопка «Обновить список качеств» в приложении)
+    result = get_video_info(url, use_cache=not bool((request.json or {}).get("refresh")))
     if "error" in result:
         return jsonify(result), 400
     # _client_index — служебное поле, не отдаём его в API-ответе
@@ -975,6 +1275,55 @@ def api_download():
     set_task(task_id, {"status": "queued", "percent": 0, "created_at": time.time()})
     threading.Thread(target=download_task, args=(task_id, url, quality), daemon=True).start()
     return jsonify({"task_id": task_id})
+
+
+@app.post("/api/fetch")
+def api_fetch():
+    """Один запрос — сразу видео (если возможно), иначе запасной путь с задачей.
+    Ответ: либо тело video/mp4 (прямой поток; X-File-Size — оценка размера,
+    X-Title — название, percent-encoded), либо JSON {"mode":"task","task_id"}
+    (дальше как раньше: /api/progress + /api/file), либо 400 JSON с ошибкой."""
+    body = request.json or {}
+    url = body.get("url", "").strip()
+    quality = body.get("quality", "best").strip()
+    if not url:
+        return jsonify({"error": "❌ URL не указан", "error_type": "validation"}), 400
+
+    clean_q = re.sub(r"\D", "", quality)
+    is_audio_only = quality.lower() in ("mp3", "audio", "audio_only")
+    height = int(clean_q) if clean_q and clean_q.isdigit() else None
+
+    neg = peek_negative_info(url)
+    if neg:
+        return jsonify({"error": neg["error"], "error_type": neg.get("error_type", "unknown")}), 400
+
+    # Без кэша инфо (приложение обычно уже вызвало /api/info) прямой путь не
+    # планируем — не тратим время на повторное извлечение.
+    plan = _plan_stream(get_cached_raw_info(url), height, is_audio_only)
+    if plan:
+        sess, first, err = _open_stream(url, plan)
+        if err:
+            return jsonify(err), 400
+        if sess:
+            cached = peek_cached_info(url)
+            title = (cached[0].get("title") if cached else None) or "video"
+            safe = re.sub(r"[^\w\sа-яА-Я.-]", "", title)[:60].strip() or "video"
+            headers = {
+                "Content-Disposition": (f"attachment; filename=\"video.mp4\"; "
+                                        f"filename*=UTF-8''{quote(safe + '.mp4')}"),
+                "X-Title": quote(title, safe=""),
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            }
+            if plan.get("size"):
+                headers["X-File-Size"] = str(plan["size"])
+            return Response(_stream_body(sess, first), mimetype="video/mp4", headers=headers)
+        print("[DEBUG] Прямой поток не завёлся — запасной путь через задачу")
+
+    task_id = uuid.uuid4().hex[:12]
+    set_task(task_id, {"status": "queued", "percent": 0, "created_at": time.time()})
+    threading.Thread(target=download_task, args=(task_id, url, quality), daemon=True).start()
+    return jsonify({"mode": "task", "task_id": task_id})
 
 
 @app.get("/api/progress/<task_id>")

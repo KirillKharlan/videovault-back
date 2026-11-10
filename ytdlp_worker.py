@@ -18,6 +18,9 @@ ytdlp_worker.py — использует yt-dlp как Python-библиотек
 stderr CLI-вызова, так что вся классификация ошибок продолжает работать).
 
 Режимы (config["mode"]):
+  "stream"   — прямая выдача: байты одиночного mp4-файла пишутся в stdout
+               (в нём в этом режиме ТОЛЬКО видео, без JSON), служебные
+               сообщения идут в stderr. Используется /api/fetch в app.py.
   "info"     — извлекает метаданные БЕЗ скачивания. Пишет одну строку
                {"type": "info", "info": {...}} с "сырым" (sanitized) info
                dict.
@@ -199,6 +202,21 @@ def run_download(cfg: dict) -> None:
         ydl.extract_info(cfg["url"], download=True)
 
 
+def run_stream(cfg: dict) -> None:
+    """Прямая выдача: байты видео пишутся В STDOUT процесса (outtmpl "-"), а не
+    в файл. Поэтому в этом режиме в stdout НЕЛЬЗЯ печатать ничего другого —
+    все сообщения yt-dlp уходят в stderr (logtostderr). cfg["format"] —
+    готовый селектор одиночного mp4-файла (без склейки видео+аудио)."""
+    opts = _common_opts(cfg)
+    opts["outtmpl"] = "-"
+    opts["logtostderr"] = True
+    opts["noprogress"] = True
+    opts["nopart"] = True
+    opts["format"] = cfg["format"]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(cfg["url"], download=True)
+
+
 def main() -> int:
     cfg = _read_config()
     mode = cfg.get("mode")
@@ -207,6 +225,8 @@ def main() -> int:
             run_info(cfg)
         elif mode == "download":
             run_download(cfg)
+        elif mode == "stream":
+            run_stream(cfg)
         else:
             raise ValueError(f"Неизвестный mode: {mode!r}")
         return 0

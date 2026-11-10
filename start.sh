@@ -21,6 +21,7 @@ pip install --quiet --upgrade bgutil-ytdlp-pot-provider
 echo "[startup] Starting gunicorn..."
 exec gunicorn app:app \
   --workers 1 \
+  --threads 8 \
   --timeout 300 \
   --bind "0.0.0.0:${PORT:-8000}" \
   --log-level info \
